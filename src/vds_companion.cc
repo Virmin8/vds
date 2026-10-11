@@ -152,7 +152,7 @@ CompanionReport build_status_report(
   }
   report[47] = 0; // Adaptive trigger output recent.
   report[48] = settings.host_persona_mode;
-  report[49] = kSupportedHostPersonaMask; // DualSense, Xbox 360, DS4.
+  report[49] = runtime.supported_host_persona_mask;
   report[51] = settings.mic_muted ? 1 : 0;
   report[57] = settings.speaker_gain_level;
   report[59] = settings.lightbar_override_enabled ? 1 : 0;
@@ -328,8 +328,8 @@ std::uint8_t apply_command(CompanionRuntime &runtime,
     settings.idle_disconnect_timeout_minutes = value;
     return kAckOk;
   case 0x21: // SET_HOST_PERSONA (0 DualSense, 1 Xbox 360, 2 DualShock 4)
-    if (!host_persona_from_value(static_cast<std::uint8_t>(value)) ||
-        value > 0xff) {
+    if (value > 7 || !host_persona_from_value(static_cast<std::uint8_t>(value)) ||
+        (runtime.supported_host_persona_mask & (1u << value)) == 0) {
       return kAckErrInvalidValue;
     }
     settings.host_persona_mode = static_cast<std::uint8_t>(value);

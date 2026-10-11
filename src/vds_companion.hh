@@ -12,6 +12,7 @@
 #include <string>
 
 #include "jsonl.hh"
+#include "vds_persona.hh"
 #include "vdsd_common.hh"
 
 namespace vds {
@@ -160,6 +161,9 @@ struct CompanionRuntime {
   std::vector<CompanionChordBinding> chord_bindings;
   std::deque<std::uint8_t> pending_input_events;
   CompanionAudioStatus audio_status;
+  // Personas this daemon can present (bit per HostPersona value); the app
+  // offers only these.
+  std::uint8_t supported_host_persona_mask = kSupportedHostPersonaMask;
   std::uint16_t settings_revision = 0;
   std::uint8_t last_command_id = 0;
   std::uint8_t last_command_sequence = 0;

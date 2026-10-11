@@ -439,7 +439,14 @@ std::uint32_t resolve_virtual_port_profile(const vds::ControllerConfig &config,
  * vds_bridge under it (as the Linux event loop does on one thread).
  */
 std::mutex g_bridge_mutex;
-vds::CompanionRuntime g_companion;
+// usbip has no DualShock 4 or Xbox 360 descriptors yet, so Windows offers
+// only the DualSense persona.
+vds::CompanionRuntime make_windows_companion_runtime() {
+  vds::CompanionRuntime runtime;
+  runtime.supported_host_persona_mask = 1u << 0;
+  return runtime;
+}
+vds::CompanionRuntime g_companion = make_windows_companion_runtime();
 
 // vds_bridge's view of the HID Bluetooth transport. Writes go through the
 // transport's output queue; feature reports are read directly.
@@ -688,14 +695,6 @@ void run_bridge_session(const std::string &device_address,
   if (!device) {
     throw std::runtime_error("failed to open Bluetooth controller: " +
                              discovery_error);
-  }
-  {
-    std::lock_guard lock(g_bridge_mutex);
-    if (vds::bridge_settings().host_persona != vds::HostPersona::DualSense) {
-      logger.log(vds::LogScope::Companion, vds::LogLevel::Warn,
-                 "DualShock 4 and Xbox 360 personas are not available on "
-                 "Windows yet; bridging as a DualSense");
-    }
   }
   std::unique_ptr<vds::win::hidhide::DeviceGuard> hidden_device =
       vds::win::hidhide::hide_device(device->instance_path, logger);

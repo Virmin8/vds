@@ -392,6 +392,12 @@ if(NOT WIN32)
   target_compile_options(controller_shortcut_test PRIVATE -UNDEBUG)
   add_test(NAME controller_shortcut_test COMMAND controller_shortcut_test)
 
+  add_executable(companion_persona_test tests/companion_persona_test.cc)
+  target_link_libraries(companion_persona_test PRIVATE vdsd_common vds_protocol jsonl
+                                                 vds_common vds_config vds_log)
+  target_compile_options(companion_persona_test PRIVATE -UNDEBUG)
+  add_test(NAME companion_persona_test COMMAND companion_persona_test)
+
   add_executable(host_session_test tests/host_session_test.cc
                                    src/platform/linux/vds_host_watch.cc)
   target_link_libraries(host_session_test PRIVATE vds_protocol)
