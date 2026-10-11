@@ -726,9 +726,7 @@ std::optional<UsbInputReport>
 bt_input_to_usb_input(std::span<const std::uint8_t> packet) {
   if (packet.size() < kBtInputMinimumSize || packet[0] != kBtHidpInputPrefix ||
       packet[kBtInputReportIdOffset] != VDS_BT_STATE_REPORT_ID ||
-      // Anything but mic audio is controller input, so an unexpected header
-      // nibble cannot silence the controller.
-      bt_input_payload_type(packet) == BtInputPayloadType::Audio) {
+      bt_input_payload_type(packet) != BtInputPayloadType::Control) {
     return std::nullopt;
   }
 

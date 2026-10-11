@@ -205,6 +205,7 @@ struct TraceState {
   std::uint64_t blocked_bt_state_count = 0;
   std::uint64_t audio_usb_frame_count = 0;
   std::uint64_t bt_input_count = 0;
+  std::uint64_t bt_input_unknown_count = 0;
   std::uint64_t bt_mic_packet_count = 0;
   std::uint64_t bt_mic_drop_count = 0;
   std::uint64_t bt_mic_decode_fail_count = 0;
@@ -1267,6 +1268,17 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
 
   auto report = vds::bt_input_to_usb_input(*packet);
   if (!report) {
+    // Not controller input or mic audio. Logged without tracing so an
+    // unexpected header shows up if input ever stops.
+    ++port.trace_state.bt_input_unknown_count;
+    if (port.trace_state.bt_input_unknown_count == 1 ||
+        port.trace_state.bt_input_unknown_count % 1000 == 0) {
+      logger.log(vds::LogScope::InputControl, vds::LogLevel::Warn,
+                 port.path + " ignored BT input packet count=" +
+                     std::to_string(port.trace_state.bt_input_unknown_count) +
+                     " len=" + std::to_string(packet->size()) + " head=" +
+                     hex_bytes(*packet, 4));
+    }
     return true;
   }
   // Idle Disconnect, checked on the raw report (before shortcuts or remapping
