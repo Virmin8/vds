@@ -128,6 +128,9 @@ constexpr std::size_t kMaxPendingAudioChunks = 8;
  * the silence, so it resumes cleanly.
  */
 constexpr std::size_t kHapticsOnlyAfterSilentPackets = 94;
+// Controller mic open re-sends while waiting for its first packet.
+constexpr std::chrono::milliseconds kMicOpenRetry{250};
+constexpr std::uint32_t kMicOpenMaxResends = 20;
 // Controller audio buffer (3 kHz samples) used while the mic records; the
 // value upstream sends with the mic.
 constexpr std::uint8_t kMicBufferLength = 64;
@@ -207,6 +210,8 @@ struct AudioStats {
   std::uint64_t mic_packets_total = 0;
   std::uint64_t mic_while_closed_total = 0;
   Clock::time_point last_mic_close_resend{};
+  // Time from opening the controller mic to its first packet (last start).
+  std::int64_t mic_startup_ms = -1;
   std::uint64_t window_late = 0;
   std::uint64_t window_refills = 0;
   std::int64_t window_max_gap_us = 0;
@@ -279,6 +284,13 @@ struct VirtualPort {
   // Host capture stream open (audio-in altsetting) vs. controller mic open.
   bool audio_in_requested = false;
   bool audio_in_stream_active = false;
+  // Controller mic start: when it was opened and whether its first packet has
+  // arrived; until then the open report is re-sent (a lost one would leave
+  // the start of a recording silent).
+  Clock::time_point mic_opened_at{};
+  Clock::time_point mic_open_resent_at{};
+  std::uint32_t mic_open_resends = 0;
+  bool mic_first_packet = false;
   bool mic_muted = false;
   bool mute_button_down = false;
   bool headset_plugged = false;
@@ -816,6 +828,10 @@ void sync_port_mic(VirtualPort &port, vds::BtL2capBackend *bt_backend,
   port.audio_in_stream_active = open;
   if (open_changed) {
     port.mic_decoder = vds::MicAudioDecoder{};
+    port.mic_opened_at = Clock::now();
+    port.mic_open_resent_at = port.mic_opened_at;
+    port.mic_open_resends = 0;
+    port.mic_first_packet = false;
   }
   if (bt_backend && (open_changed || (open && mute_changed))) {
     bt_backend->try_send_output_report(
@@ -1299,6 +1315,18 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
 
     ++port.audio_stats.mic_packets_total;
     ++port.audio_stats.window_mic_packets;
+    if (!port.mic_first_packet) {
+      port.mic_first_packet = true;
+      port.audio_stats.mic_startup_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              read_time - port.mic_opened_at)
+              .count();
+      logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
+                 port.path + " controller mic first packet after " +
+                     std::to_string(port.audio_stats.mic_startup_ms) +
+                     " ms, open re-sent " +
+                     std::to_string(port.mic_open_resends) + " times");
+    }
     try {
       auto pcm = port.mic_decoder.decode(*opus_payload);
       port.trace_state.mic_peak_permille =
@@ -2227,6 +2255,37 @@ void enqueue_speaker_waveout_chunk(VirtualPort &port, std::uint32_t trace_flags,
   }
 }
 
+// Re-sends the controller mic open until its first packet arrives.
+void retry_mic_open(VirtualPort &port, vds::BtL2capBackend &bt_backend,
+                    vds::Logger &logger) {
+  if (!port.audio_in_stream_active || port.mic_first_packet ||
+      port.mic_open_resends >= kMicOpenMaxResends) {
+    return;
+  }
+  const auto now = Clock::now();
+  if (now - port.mic_open_resent_at < kMicOpenRetry) {
+    return;
+  }
+  port.mic_open_resent_at = now;
+  ++port.mic_open_resends;
+  bt_backend.try_send_output_report(
+      port.output_state.build_bt_mic_state_report(true, port.mic_muted));
+  const bool sent = bt_backend.try_send_output_report(
+      port.output_state.build_bt_mic_report(
+          true, std::max(port.audio_stats.buffer_length, kMicBufferLength)));
+  logger.log(vds::LogScope::InputAudio, vds::LogLevel::Debug,
+             port.path + " controller mic open re-sent count=" +
+                 std::to_string(port.mic_open_resends) +
+                 " sent=" + (sent ? "yes" : "no"));
+}
+
+bool mic_open_retry_pending(const std::vector<VirtualPort> &ports) {
+  return std::any_of(ports.begin(), ports.end(), [](const VirtualPort &port) {
+    return port.audio_in_stream_active && !port.mic_first_packet &&
+           port.mic_open_resends < kMicOpenMaxResends;
+  });
+}
+
 void flush_pending_outputs(std::vector<VirtualPort> &ports,
                            std::vector<ControllerRuntime> &controllers,
                            std::uint32_t trace_flags, vds::Logger &logger,
@@ -2252,6 +2311,7 @@ void flush_pending_outputs(std::vector<VirtualPort> &ports,
                                          logger)) {
         continue;
       }
+      retry_mic_open(port, *controller.backend, logger);
       enqueue_speaker_waveout_chunk(port, trace_flags, logger);
       (void)flush_pending_audio_chunk(port, *controller.backend, trace_flags,
                                       logger);
@@ -2929,6 +2989,7 @@ std::string handle_audio_stats_request(std::span<const VirtualPort> ports,
     reply += ",\"mic_packets_per_second\":" +
              fixed(window_s > 0.0 ? stats.window_mic_packets / window_s : 0.0, 1);
     reply += ",\"mic_packets_total\":" + std::to_string(stats.mic_packets_total);
+    reply += ",\"mic_startup_ms\":" + std::to_string(stats.mic_startup_ms);
     reply += ",\"mic_while_closed_total\":" +
              std::to_string(stats.mic_while_closed_total);
     reply += ",\"haptics_only_total\":" + std::to_string(stats.haptics_only_total);
@@ -3724,6 +3785,10 @@ int main(int argc, char **argv) {
       }
       std::array<epoll_event, 64> events{};
       int timeout_ms = next_wakeup_timeout_ms(ports, controllers);
+      if (mic_open_retry_pending(ports)) {
+        const int retry_ms = static_cast<int>(kMicOpenRetry.count());
+        timeout_ms = timeout_ms < 0 ? retry_ms : std::min(timeout_ms, retry_ms);
+      }
       if (host_watch_fd) {
         timeout_ms = timeout_ms < 0 ? 2000 : std::min(timeout_ms, 2000);
       }
