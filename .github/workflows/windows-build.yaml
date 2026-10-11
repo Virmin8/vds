@@ -47,3 +47,23 @@ jobs:
             build/windows/Release/*.exe
             build/windows/Release/*.dll
           if-no-files-found: error
+
+      # The self-contained build OpenDS5 bundles: static C++ runtime and Opus,
+      # so the installer needs no Visual C++ Redistributable.
+      - name: Build (static, for OpenDS5)
+        shell: pwsh
+        run: |
+          cmake -S . -B build\static `
+            -DVDS_STATIC_MSVC_RUNTIME=ON `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VDS_VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
+          cmake --build build\static --config Release --parallel --target vdsd vdsctl
+          $Dlls = Get-ChildItem build\static\Release\*.dll -ErrorAction SilentlyContinue
+          if ($Dlls) { throw "static build still needs: $($Dlls.Name -join ', ')" }
+
+      - name: Upload static binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: vdsd-windows-static
+          path: build/static/Release/*.exe
+          if-no-files-found: error

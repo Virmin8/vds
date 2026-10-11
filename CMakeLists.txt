@@ -1,10 +1,22 @@
 cmake_minimum_required(VERSION 3.12)
 
+# CMAKE_MSVC_RUNTIME_LIBRARY (VDS_STATIC_MSVC_RUNTIME below) needs CMP0091.
+if(POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW)
+endif()
+
 project(vds LANGUAGES CXX)
 
 option(INSTALL_SERVICE "Register vdsd as a system service during install" OFF)
 option(STOP_SERVICE "Stop vdsd before service install or uninstall" ON)
 mark_as_advanced(STOP_SERVICE)
+# Windows: link the C++ runtime statically, so vdsd.exe runs without the
+# Visual C++ Redistributable. Pair with the x64-windows-static vcpkg triplet
+# so Opus is linked in as well (OpenDS5 bundles vdsd this way).
+option(VDS_STATIC_MSVC_RUNTIME "Link the MSVC runtime statically" OFF)
+if(VDS_STATIC_MSVC_RUNTIME)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 include(GNUInstallDirs)
 if(WIN32 AND CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
@@ -344,8 +356,11 @@ endif()
 
 install(TARGETS vdsd vdsctl RUNTIME DESTINATION ${VDS_RUNTIME_INSTALL_DIR})
 if(WIN32)
-  install(FILES "$<TARGET_FILE:${VDS_OPUS_TARGET}>"
-          DESTINATION ${VDS_RUNTIME_INSTALL_DIR})
+  get_target_property(VDS_OPUS_TYPE ${VDS_OPUS_TARGET} TYPE)
+  if(VDS_OPUS_TYPE STREQUAL "SHARED_LIBRARY")
+    install(FILES "$<TARGET_FILE:${VDS_OPUS_TARGET}>"
+            DESTINATION ${VDS_RUNTIME_INSTALL_DIR})
+  endif()
 endif()
 
 if(WIN32)
