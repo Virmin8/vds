@@ -7,6 +7,7 @@
 
 const struct vds_controller_profile vds_dualsense_edge_profile = {
 	.profile = VDS_PROFILE_DSE,
+	.vendor_id = VDS_SONY_VENDOR_ID,
 	.product_id = VDS_DSE_PRODUCT_ID,
 	.device_version = VDS_USB_DEVICE_BCD,
 	.device_class = VDS_USB_DEVICE_CLASS,

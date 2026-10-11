@@ -25,6 +25,7 @@ enum vds_controller_audio_feature {
 
 struct vds_controller_profile {
 	u32 profile;
+	u16 vendor_id;
 	u16 product_id;
 	u16 device_version;
 	u8 device_class;
@@ -56,6 +57,8 @@ struct vds_controller_profile {
 
 extern const struct vds_controller_profile vds_dualsense_profile;
 extern const struct vds_controller_profile vds_dualsense_edge_profile;
+extern const struct vds_controller_profile vds_ds4_profile;
+extern const struct vds_controller_profile vds_xbox360_profile;
 
 static inline int
 vds_controller_audio_feature_index(const struct vds_controller_profile *profile,

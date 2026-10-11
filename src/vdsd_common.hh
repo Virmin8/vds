@@ -16,6 +16,7 @@
 namespace vds {
 
 class Logger;
+struct CompanionRuntime;
 
 inline constexpr std::uint32_t kTraceInput = 1u << 0;
 inline constexpr std::uint32_t kTraceOutput = 1u << 1;
@@ -31,6 +32,13 @@ struct VdsdControlControllerStatus {
   std::string address;
   bool connected = false;
   std::string path;
+  // Raw DualSense power status byte from the latest input report: low
+  // nibble battery capacity 0-10, high nibble charging state. 0xff unknown.
+  std::uint8_t battery_status = 0xff;
+  // Bluetooth link RSSI (HCI Read RSSI; ~0 in golden range, negative when
+  // weaker), valid only while connected.
+  bool rssi_valid = false;
+  std::int8_t rssi = 0;
 };
 
 struct VdsdControlPortStatus {
@@ -114,6 +122,7 @@ std::string handle_vdsd_control_command(
     std::span<const VdsdControlControllerStatus> controllers,
     std::span<const VdsdControlPortStatus> ports,
     const std::function<std::vector<ControllerTarget>()> &list_targets,
-    std::uint32_t &trace_flags, bool &reload_requested, Logger &logger);
+    std::uint32_t &trace_flags, bool &reload_requested,
+    CompanionRuntime &companion, Logger &logger);
 
 } // namespace vds

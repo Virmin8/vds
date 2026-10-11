@@ -10,9 +10,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <set>
 #include <iostream>
 #include <optional>
 #include <span>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -24,7 +28,14 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/hci.h>
+#include <bluetooth/hci_lib.h>
+#include <dirent.h>
+#include <grp.h>
+#include <linux/input.h>
 #include <sys/epoll.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -35,15 +46,20 @@
 #include "unique_fd.hh"
 #include "vds/ds5_protocol.h"
 #include "vds_bluez.hh"
+#include "vds_sleep_watch.hh"
+#include "vds_host_watch.hh"
 #include "vds_bt.hh"
+#include "vds_bt_mode.hh"
 #include "vds_build_info.hh"
 #include "vds_common.hh"
 #include "vds_config.hh"
 #include "vds_io.hh"
 #include "vds_log.hh"
+#include "vds_persona.hh"
 #include "vds_profile.hh"
 #include "vds_protocol.hh"
 #include "vds_udev.hh"
+#include "vds_companion.hh"
 #include "vdsd_common.hh"
 
 namespace {
@@ -67,22 +83,47 @@ constexpr std::uint64_t kOutputTraceSummaryInterval = 250;
 constexpr int kMaxPortFramesPerWake = 64;
 constexpr int kMaxBtPacketsPerWake = 64;
 constexpr int kPendingOutputPollMs = 2;
+constexpr std::size_t kLinuxSpeakerInputFrames = vds::kSpeakerInputFrames;
 constexpr auto kInputTraceGapWarn = std::chrono::milliseconds(20);
 constexpr auto kInputTraceSlowWriteWarn = std::chrono::milliseconds(5);
 constexpr auto kOutputTraceSlowWarn = std::chrono::milliseconds(5);
 constexpr auto kOutputTraceFeatureSlowWarn = std::chrono::milliseconds(20);
 /*
- * 0x36 carries both a haptics block and a 10 ms Opus speaker block. Pace the
- * combined packet at the speaker frame interval; using the 64-byte haptics
- * duration here lets speaker audio drift into periodic underruns after a few
- * seconds.
+ * Keep the Linux sender cadence aligned with the 512-frame extraction window
+ * used by the Windows transport (~10.67 ms per 0x36 packet); the extractor
+ * resamples each window to one Opus frame.
  */
-constexpr auto kAudioOutputInterval = std::chrono::milliseconds(10);
+constexpr auto kAudioOutputInterval = std::chrono::microseconds(
+    (static_cast<std::int64_t>(kLinuxSpeakerInputFrames) * 1000000 +
+     VDS_AUDIO_SAMPLE_RATE / 2) /
+    VDS_AUDIO_SAMPLE_RATE);
+/*
+ * A send that is at most this late keeps the fixed cadence (the next packet
+ * goes out immediately to catch up); anything later resyncs to the wall clock
+ * so a stalled stream does not replay a backlog.
+ */
+constexpr auto kMaxAudioCatchup = 2 * kAudioOutputInterval;
+/*
+ * Chunks to buffer after the queue runs dry before sending again (~21 ms).
+ * Input and output run at the same rate, so this stays as latency on every
+ * speaker sample and haptic for the rest of the stream; AudioQueueTrimmer keeps
+ * it from growing past this. One chunk is not enough: USB delivers audio in
+ * bursts that do not line up with the send times, and the queue keeps running
+ * dry (tested: refills climbed continuously).
+ */
+constexpr std::size_t kAudioPrimeChunks = 2;
 constexpr auto kHapticsOutputBlockedRetry = std::chrono::milliseconds(2);
 constexpr auto kBluetoothPreemptWait = std::chrono::milliseconds(2000);
 constexpr auto kBluetoothPreemptPoll = std::chrono::milliseconds(100);
 constexpr int kInitialFeatureReportPollMs = 5000;
 constexpr std::size_t kMaxPendingAudioChunks = 8;
+/*
+ * Speaker-silent packets (~1 s) before switching to haptics-only 0x33 reports:
+ * the same haptics and state in about half the airtime of 0x36. Speaker audio
+ * switches back to 0x36 on its first packet; the Opus encoder keeps running on
+ * the silence, so it resumes cleanly.
+ */
+constexpr std::size_t kHapticsOnlyAfterSilentPackets = 94;
 constexpr std::uint8_t kTestCommandReportId = 0x80;
 constexpr std::uint8_t kTestCommandResultReportId = 0x81;
 constexpr std::uint8_t kTestCommandCompleteStatus = 0x02;
@@ -100,17 +141,51 @@ constexpr std::array<std::uint8_t, 3> kInitialFeatureReportIds = {0x09, 0x20,
                                                                   0x05};
 
 volatile sig_atomic_t g_stop_requested = 0;
+// True while BlueZ's input plugin owns the HID PSMs ("normal" Bluetooth mode);
+// vdsd must then leave BlueZ-connected controllers alone.
+bool g_bluetooth_normal_mode = false;
+// Host persona selected through the companion app; applied to each virtual
+// port when its controller connects and whenever it changes.
+vds::HostPersona g_host_persona = vds::HostPersona::DualSense;
+// Built-in speaker loudness boost (--speaker-boost-db); bypassed while
+// headphones are plugged into the controller.
+float g_speaker_boost_db = vds::kDefaultSpeakerBoostDb;
 
 struct Options {
   std::string socket = kDefaultControlSocket;
   std::string log_path = vds::kDefaultLogPath;
   std::string db_path = vds::kDefaultDbPath;
+  std::string bluetooth_override_script = vds::kDefaultBluetoothOverrideScript;
+  float speaker_boost_db = vds::kDefaultSpeakerBoostDb;
 };
 
 struct LatencyTraceStats {
   std::uint64_t count = 0;
   std::uint64_t total_us = 0;
   std::uint64_t max_us = 0;
+};
+
+/*
+ * Always-on audio delivery stats for the companion Diagnostics view. The
+ * controller does not report buffer underruns, so a send gap longer than the
+ * controller's audio buffer is counted as a probable dropout ("late").
+ */
+struct AudioStats {
+  std::uint8_t buffer_length = 64; // 3 kHz samples
+  bool buffer_auto = false;
+  std::uint64_t trims_total = 0;
+  bool haptics_only = false;
+  std::uint64_t haptics_only_total = 0;
+  Clock::time_point last_send{};
+  std::uint64_t packets_total = 0;
+  std::uint64_t late_total = 0;
+  std::uint64_t refills_total = 0;
+  // Since the previous `audio` control request.
+  Clock::time_point window_start{};
+  std::uint64_t window_packets = 0;
+  std::uint64_t window_late = 0;
+  std::uint64_t window_refills = 0;
+  std::int64_t window_max_gap_us = 0;
 };
 
 struct TraceState {
@@ -153,8 +228,8 @@ using vds::trim_command;
 struct VirtualPort {
   std::string path;
   vds::UniqueFd fd;
-  vds::PcmAudioExtractor extractor;
-  vds::PcmAudioExtractor waveout_extractor;
+  vds::PcmAudioExtractor extractor{kLinuxSpeakerInputFrames};
+  vds::PcmAudioExtractor waveout_extractor{kLinuxSpeakerInputFrames};
   vds::HapticsPacketBuilder haptics_builder;
   vds::DsOutputState output_state;
   std::deque<vds::AudioChunk> pending_audio_chunks;
@@ -162,14 +237,51 @@ struct VirtualPort {
   std::optional<vds::DsState> pending_bt_state;
   std::optional<vds::BtStateReport> pending_bt_state_report;
   Clock::time_point next_haptics_send_time{};
+  bool audio_primed = false;
+  vds::AudioQueueTrimmer queue_trimmer;
+  vds::HapticsBufferTuner buffer_tuner;
+  std::size_t silent_speaker_packets = 0;
+  vds::HostPersona persona = vds::HostPersona::DualSense;
+  vds::PersonaState persona_state;
   bool speaker_waveout_selected = true;
   bool speaker_waveout_active = false;
   std::uint32_t speaker_waveout_phase = 0;
+  std::uint16_t haptics_gain_percent = 100;
+  std::uint8_t battery_status = 0xff;
+  // Restore after a native DualSense game: watch the virtual controller's
+  // hidraw node. Each program that opens it (in order) keeps a snapshot of
+  // the output state from just before it did; when the latest one closes it,
+  // that snapshot is restored (a Steam started later stays underneath).
+  struct HostSession {
+    pid_t pid;
+    vds::DsOutputState::HostState before;
+  };
+  std::string hidraw_node;
+  int hidraw_watch = -1;
+  std::set<pid_t> host_baseline;
+  std::vector<HostSession> host_sessions;
+  bool headphones_plugged = false;
+  // Idle Disconnect: last input that counts as activity.
+  Clock::time_point last_input_activity{};
+  // Diagnostic counters: the `audio` control request resets the window part.
+  mutable AudioStats audio_stats;
+  vds::CompanionInputState companion_input;
   std::array<std::vector<std::uint8_t>, 256> feature_cache;
   std::array<bool, 256> feature_cached;
   std::vector<std::uint8_t> pending_feature_reports;
   TraceState trace_state;
 };
+
+float speaker_boost_db(const VirtualPort &port) {
+  return port.headphones_plugged ? 0.0f : g_speaker_boost_db;
+}
+
+// The companion speaker volume slider only applies to the built-in speaker.
+std::uint16_t speaker_volume_percent(const VirtualPort &port) {
+  return port.headphones_plugged
+             ? 100
+             : port.output_state.companion_overrides().speaker_volume_percent;
+}
 
 struct ControllerRuntime {
   vds::ControllerConfig config;
@@ -190,6 +302,8 @@ enum class EventKind : std::uint32_t {
   BtAcceptControl = 5,
   BtAcceptInterrupt = 6,
   Udev = 7,
+  Sleep = 8,
+  HostWatch = 9,
 };
 
 struct EventSource {
@@ -215,7 +329,9 @@ Options parse_platform_args(int argc, char **argv) {
   Options options;
   vds::VdsdCommonOptions common = vds::default_vdsd_common_options();
   const std::string platform_options =
-      std::string("[--socket ") + kDefaultControlSocket + "]";
+      std::string("[--socket ") + kDefaultControlSocket +
+      "] [--bluetooth-override-script " +
+      vds::kDefaultBluetoothOverrideScript + "] [--speaker-boost-db 0-18]";
   const auto next_value = [&](int &index, std::string_view option) {
     if (index + 1 >= argc) {
       throw std::runtime_error(std::string(option) + " requires a value");
@@ -233,6 +349,19 @@ Options parse_platform_args(int argc, char **argv) {
       }
     } else if (arg == "--socket") {
       options.socket = next_value(i, arg);
+    } else if (arg == "--bluetooth-override-script") {
+      options.bluetooth_override_script = next_value(i, arg);
+    } else if (arg == "--speaker-boost-db") {
+      const std::string value = next_value(i, arg);
+      try {
+        options.speaker_boost_db = std::stof(value);
+      } catch (const std::exception &) {
+        throw std::runtime_error("--speaker-boost-db needs a number");
+      }
+      if (options.speaker_boost_db < 0.0f ||
+          options.speaker_boost_db > vds::kMaxSpeakerBoostDb) {
+        throw std::runtime_error("--speaker-boost-db must be 0-18");
+      }
     } else {
       throw std::runtime_error("unknown argument: " + std::string(arg));
     }
@@ -385,6 +514,11 @@ int open_control_socket(const std::string &path) {
     const int error = errno;
     throw std::runtime_error("failed to bind control socket " + path + ": " +
                              std::strerror(error));
+  }
+  // When a "vds" group exists, grant it socket access so unprivileged
+  // clients (the companion app, vdsctl) can talk to the daemon.
+  if (const struct group *vds_group = ::getgrnam("vds")) {
+    (void)::chown(path.c_str(), 0, vds_group->gr_gid);
   }
   (void)::chmod(path.c_str(), 0660);
 
@@ -555,11 +689,14 @@ void ioctl_set_profile(int fd, std::uint32_t profile) {
 }
 
 void reset_virtual_port(VirtualPort &port) {
-  port.extractor = vds::PcmAudioExtractor{};
-  port.waveout_extractor = vds::PcmAudioExtractor{};
+  port.extractor = vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
+  port.waveout_extractor =
+      vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
   port.haptics_builder = vds::HapticsPacketBuilder{};
+  port.haptics_builder.set_buffer_length(port.audio_stats.buffer_length);
   port.output_state = vds::DsOutputState{};
   port.pending_audio_chunks.clear();
+  port.audio_primed = false;
   port.last_sent_bt_state.reset();
   port.pending_bt_state.reset();
   port.pending_bt_state_report.reset();
@@ -567,6 +704,13 @@ void reset_virtual_port(VirtualPort &port) {
   port.speaker_waveout_selected = true;
   port.speaker_waveout_active = false;
   port.speaker_waveout_phase = 0;
+  port.haptics_gain_percent = 100;
+  port.battery_status = 0xff;
+  port.headphones_plugged = false;
+  port.host_sessions.clear();
+  port.last_input_activity = {};
+  port.audio_stats = {};
+  port.companion_input = {};
   port.feature_cache = {};
   port.feature_cached = {};
   port.pending_feature_reports.clear();
@@ -575,6 +719,7 @@ void reset_virtual_port(VirtualPort &port) {
 
 void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
   port.pending_audio_chunks.clear();
+  port.audio_primed = false;
   port.next_haptics_send_time = {};
   port.speaker_waveout_active = false;
   port.speaker_waveout_phase = 0;
@@ -613,6 +758,23 @@ void handle_frame(const vds_frame_header &header,
       line << " stream=" << (event.altsetting != 0 ? "on" : "off");
     }
     logger.log("usb", vds::LogLevel::Info, line.str());
+    if (event.interface_kind == VDS_USB_INTERFACE_AUDIO_OUT) {
+      const bool active = event.altsetting != 0;
+      port.output_state.set_audio_out_stream_active(active);
+      port.pending_audio_chunks.clear();
+      port.audio_primed = false;
+      port.next_haptics_send_time = {};
+      if (active) {
+        port.extractor =
+            vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
+      }
+      if (bt_backend) {
+        forward_bt_state_if_changed(
+            port, *bt_backend, trace_flags, logger,
+            active ? "audio out interface route on"
+                   : "audio out interface route off");
+      }
+    }
     return;
   }
 
@@ -663,7 +825,18 @@ void handle_frame(const vds_frame_header &header,
     if (output_trace) {
       trace_hid_out_report(port.path, payload, port.trace_state, logger);
     }
-    if (!port.output_state.apply_usb_output_report(payload)) {
+    std::optional<std::array<std::uint8_t, 1 + VDS_SET_STATE_SIZE>>
+        persona_output;
+    std::span<const std::uint8_t> ds5_output = payload;
+    if (port.persona != vds::HostPersona::DualSense) {
+      persona_output = vds::persona_output_to_ds5(port.persona, payload,
+                                                  port.persona_state);
+      if (!persona_output) {
+        return;
+      }
+      ds5_output = *persona_output;
+    }
+    if (!port.output_state.apply_usb_output_report(ds5_output)) {
       if (output_trace) {
         logger.log("hid", vds::LogLevel::Debug,
                    port.path + " hid out ignored: unsupported output report");
@@ -699,6 +872,24 @@ void handle_frame(const vds_frame_header &header,
             ? static_cast<unsigned>(payload[1] |
                                     (static_cast<unsigned>(payload[2]) << 8))
             : (payload.size() >= 2 ? static_cast<unsigned>(payload[1]) : 0);
+    if (port.persona == vds::HostPersona::Ds4) {
+      // DS4 feature reports are answered locally; calibration and MAC come
+      // from the DualSense's cached reports 0x05 and 0x09.
+      const auto cached = [&](std::uint8_t id) {
+        return port.feature_cached[id]
+                   ? std::span<const std::uint8_t>(port.feature_cache[id])
+                   : std::span<const std::uint8_t>();
+      };
+      const auto reply = vds::ds4_feature_report(
+          report_id, requested_length, cached(0x05), cached(0x09));
+      const auto frame =
+          vds::frame_bytes(VDS_FRAME_USB_FEATURE_REPLY, reply);
+      (void)write_vds_frame(port, frame, output_trace, logger);
+      return;
+    }
+    if (port.persona != vds::HostPersona::DualSense) {
+      return;
+    }
     const bool cache_hit = port.feature_cached[report_id];
     if (output_trace) {
       logger.log("hid", vds::LogLevel::Debug,
@@ -736,6 +927,10 @@ void handle_frame(const vds_frame_header &header,
       return;
     }
     const std::uint8_t report_id = payload[0];
+    if (port.persona != vds::HostPersona::DualSense) {
+      // Persona feature writes (DS4 probes) must not reach the DualSense.
+      return;
+    }
     if (output_trace) {
       logger.log("hid", vds::LogLevel::Debug,
                  port.path + " feature set report=" + hex_u8(report_id) +
@@ -788,10 +983,12 @@ void handle_frame(const vds_frame_header &header,
           const bool speaker_waveout = enable && port.speaker_waveout_selected;
           port.speaker_waveout_active = speaker_waveout;
           port.speaker_waveout_phase = 0;
-          port.waveout_extractor = vds::PcmAudioExtractor{};
+          port.waveout_extractor =
+              vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
           port.output_state.set_audio_out_stream_active(speaker_waveout);
           if (!speaker_waveout) {
             port.pending_audio_chunks.clear();
+            port.audio_primed = false;
           }
           if (bt_backend) {
             forward_bt_state_if_changed(port, *bt_backend, trace_flags, logger,
@@ -834,6 +1031,10 @@ void handle_frame(const vds_frame_header &header,
   std::size_t dropped_chunks = 0;
   const auto audio_start = Clock::now();
   const auto extract_start = Clock::now();
+  port.extractor.set_speaker_boost_db(speaker_boost_db(port));
+  port.extractor.set_speaker_volume_percent(speaker_volume_percent(port));
+  port.extractor.set_haptics_gain_percent(port.haptics_gain_percent);
+  port.extractor.set_speaker_mono(!port.headphones_plugged);
   const auto chunks = port.extractor.push_usb_audio(payload);
   const auto extract_duration = Clock::now() - extract_start;
   for (const auto &chunk : chunks) {
@@ -857,8 +1058,8 @@ void handle_frame(const vds_frame_header &header,
 
     /*
      * USB isochronous URBs can arrive in bursts. Queue completed 0x36 audio
-     * chunks here and let flush_pending_outputs() send them at the 10 ms
-     * speaker frame interval, otherwise speaker/haptics audio turns into
+     * chunks here and let flush_pending_outputs() send them at the
+     * kAudioOutputInterval speaker frame interval, otherwise speaker/haptics audio turns into
      * audible bursts.
      */
     if (port.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
@@ -935,12 +1136,53 @@ bool handle_vds_frame(VirtualPort &port, vds::BtL2capBackend *bt_backend,
 }
 
 bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
+                     vds::CompanionRuntime &companion,
                      std::uint32_t trace_flags, vds::Logger &logger) {
   const auto read_time = Clock::now();
-  const auto report = bt_backend.read_input_report();
+  auto report = bt_backend.read_input_report();
   if (!report) {
     return false;
   }
+  // Idle Disconnect, checked on the raw report (before shortcuts or remapping
+  // hide buttons). Turning the controller off drops the link like the
+  // companion's Turn Off; the normal hang-up path then cleans up.
+  if (port.last_input_activity == Clock::time_point{} ||
+      vds::controller_input_active(*report)) {
+    port.last_input_activity = read_time;
+  } else if (companion.settings.idle_disconnect_enabled &&
+             read_time - port.last_input_activity >
+                 std::chrono::minutes(
+                     companion.settings.idle_disconnect_timeout_minutes)) {
+    port.last_input_activity = read_time;
+    logger.log("bluetooth", vds::LogLevel::Info,
+               "idle for " +
+                   std::to_string(companion.settings.idle_disconnect_timeout_minutes) +
+                   " min; turning controller off address=" +
+                   bt_backend.address());
+    try {
+      (void)vds::disconnect_bluez_device(bt_backend.address());
+    } catch (const std::exception &error) {
+      logger.log("bluetooth", vds::LogLevel::Warn,
+                 "idle turn off failed address=" + bt_backend.address() +
+                     " error=" + error.what());
+    }
+  }
+  vds::companion_translate_input(companion, port.companion_input,
+                                 std::span<std::uint8_t>(*report));
+  // USB input payload offset 52 (report byte 53) carries the DualSense
+  // power status: low nibble battery capacity 0-10, high nibble state.
+  port.battery_status = (*report)[53];
+  // Report byte 54 bit 0: headphones plugged into the controller's jack.
+  const bool headphones = ((*report)[54] & 0x01) != 0;
+  if (headphones != port.headphones_plugged) {
+    port.headphones_plugged = headphones;
+    logger.log("audio", vds::LogLevel::Info,
+               port.path + (headphones ? " headphones plugged in; stereo, "
+                                         "speaker boost off"
+                                       : " headphones unplugged; mono speaker, "
+                                         "boost on"));
+  }
+
   const bool input_trace = trace_enabled(trace_flags, kTraceInput);
   if (input_trace) {
     ++port.trace_state.bt_input_count;
@@ -976,14 +1218,23 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
     }
   }
 
+  // DualShock 4 / Xbox 360 personas get the DualSense report translated.
+  std::span<const std::uint8_t> host_report(*report);
+  const std::vector<std::uint8_t> persona_report = vds::persona_input_report(
+      port.persona, host_report, port.persona_state);
+  if (!persona_report.empty()) {
+    host_report = persona_report;
+  }
+
   vds_frame_header header{};
   header.type = VDS_FRAME_USB_HID_IN;
-  header.length = static_cast<std::uint32_t>(report->size());
+  header.length = static_cast<std::uint32_t>(host_report.size());
 
   std::array<std::uint8_t, sizeof(header) + vds::kUsbInputReportSize> frame{};
   std::memcpy(frame.data(), &header, sizeof(header));
-  std::memcpy(frame.data() + sizeof(header), report->data(), report->size());
-  const std::span bytes(frame.data(), sizeof(header) + report->size());
+  std::memcpy(frame.data() + sizeof(header), host_report.data(),
+              host_report.size());
+  const std::span bytes(frame.data(), sizeof(header) + host_report.size());
 
   const auto write_start = Clock::now();
   const bool wrote = write_vds_frame(port, bytes, input_trace, logger);
@@ -1247,8 +1498,9 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
     updated.push_back(VirtualPort{
         .path = device,
         .fd = std::move(fd),
-        .extractor = vds::PcmAudioExtractor{},
-        .waveout_extractor = vds::PcmAudioExtractor{},
+        .extractor = vds::PcmAudioExtractor{kLinuxSpeakerInputFrames},
+        .waveout_extractor =
+            vds::PcmAudioExtractor{kLinuxSpeakerInputFrames},
         .haptics_builder = {},
         .output_state = {},
         .pending_audio_chunks = {},
@@ -1279,7 +1531,8 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
 
 void preempt_default_bluetooth_owner(const std::string &address,
                                      vds::Logger &logger) {
-  if (!vds::bluetooth_hid_device_present(address)) {
+  if (g_bluetooth_normal_mode ||
+      !vds::bluetooth_hid_device_present(address)) {
     return;
   }
 
@@ -1320,8 +1573,11 @@ void complete_pending_controller(ControllerRuntime &controller,
                                 std::move(controller.pending_interrupt_fd));
 
   reset_virtual_port(port);
+  port.persona = g_host_persona;
+  port.persona_state = {};
   ioctl_noarg(port.fd.get(), VDS_IOC_DISCONNECT, "VDS_IOC_DISCONNECT");
-  ioctl_set_profile(port.fd.get(), profile);
+  ioctl_set_profile(port.fd.get(),
+                    vds::usb_profile_for_persona(port.persona, profile));
   initialize_bt_controller(candidate, port, logger);
   candidate.send_output_report(port.output_state.build_bt_init_report());
   port.last_sent_bt_state = port.output_state.state();
@@ -1445,45 +1701,50 @@ void handle_bt_accept(std::vector<VirtualPort> &ports,
   }
 }
 
-bool has_pending_bt_output(std::span<const VirtualPort> ports,
-                           std::span<const ControllerRuntime> controllers) {
-  for (const auto &controller : controllers) {
-    if (!controller.backend) {
-      continue;
-    }
-    const auto port_index = find_port_index(ports, controller.device);
-    if (port_index && (ports[*port_index].pending_bt_state_report ||
-                       !ports[*port_index].pending_audio_chunks.empty() ||
-                       ports[*port_index].speaker_waveout_active)) {
-      return true;
-    }
-  }
-  return false;
+/*
+ * After the queue runs dry, hold sending until kAudioPrimeChunks are buffered.
+ * The WebHID waveout generator only queues one chunk at a time, so it is
+ * exempt.
+ */
+bool audio_chunk_ready(const VirtualPort &port) {
+  const std::size_t needed =
+      port.audio_primed || port.speaker_waveout_active ? 1 : kAudioPrimeChunks;
+  return port.pending_audio_chunks.size() >= needed;
 }
 
 int next_wakeup_timeout_ms(std::span<const VirtualPort> ports,
                            std::span<const ControllerRuntime> controllers) {
   const auto now = Clock::now();
   int timeout_ms = 60000;
-  if (has_pending_bt_output(ports, controllers)) {
-    timeout_ms = std::min(timeout_ms, kPendingOutputPollMs);
-  }
   for (const auto &controller : controllers) {
     if (!controller.backend) {
       continue;
     }
     const auto port_index = find_port_index(ports, controller.device);
-    if (!port_index || ports[*port_index].pending_audio_chunks.empty()) {
+    if (!port_index) {
+      continue;
+    }
+    const auto &port = ports[*port_index];
+    const bool audio_due =
+        audio_chunk_ready(port) || port.speaker_waveout_active;
+    if (!audio_due) {
+      if (!port.pending_bt_state_report) {
+        continue;
+      }
+      timeout_ms = std::min(timeout_ms, kPendingOutputPollMs);
       continue;
     }
 
-    const auto next_time = ports[*port_index].next_haptics_send_time;
+    const auto next_time = port.next_haptics_send_time;
     if (next_time == Clock::time_point{} || next_time <= now) {
       return 0;
     }
     const auto audio_wait =
         std::chrono::ceil<std::chrono::milliseconds>(next_time - now);
     timeout_ms = std::min(timeout_ms, static_cast<int>(audio_wait.count()));
+    if (port.pending_bt_state_report) {
+      timeout_ms = std::min(timeout_ms, kPendingOutputPollMs);
+    }
   }
   return timeout_ms;
 }
@@ -1492,6 +1753,15 @@ bool flush_pending_audio_chunk(VirtualPort &port,
                                vds::BtL2capBackend &bt_backend,
                                std::uint32_t trace_flags, vds::Logger &logger) {
   if (port.pending_audio_chunks.empty()) {
+    if (port.audio_primed) {
+      // Ran dry mid-stream: the next packets wait for a refill.
+      ++port.audio_stats.refills_total;
+      ++port.audio_stats.window_refills;
+    }
+    port.audio_primed = false;
+    return true;
+  }
+  if (!audio_chunk_ready(port)) {
     return true;
   }
 
@@ -1501,12 +1771,31 @@ bool flush_pending_audio_chunk(VirtualPort &port,
     return true;
   }
 
+  if (!port.audio_primed) {
+    port.queue_trimmer.reset();
+  }
+  if (port.queue_trimmer.should_trim(port.pending_audio_chunks.size())) {
+    // A standing backlog is pure haptics latency: skip one chunk to drain it.
+    port.pending_audio_chunks.pop_front();
+    ++port.audio_stats.trims_total;
+  }
+
   const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
   const auto &chunk = port.pending_audio_chunks.front();
-  const auto packet = port.haptics_builder.build_packet(
-      chunk.haptics, chunk.speaker, port.output_state.state());
+  // Haptics gain is applied by the extractor before 8-bit quantization.
+  const bool haptics_only =
+      !port.speaker_waveout_active &&
+      port.silent_speaker_packets >= kHapticsOnlyAfterSilentPackets &&
+      !chunk.has_speaker_signal;
   const auto send_start = Clock::now();
-  if (!bt_backend.try_send_output_report(packet)) {
+  const bool sent =
+      haptics_only
+          ? bt_backend.try_send_output_report(
+                port.haptics_builder.build_haptics_only_packet(
+                    chunk.haptics, port.output_state.state()))
+          : bt_backend.try_send_output_report(port.haptics_builder.build_packet(
+                chunk.haptics, chunk.speaker, port.output_state.state()));
+  if (!sent) {
     ++port.trace_state.dropped_audio_haptics_count;
     ++port.trace_state.blocked_audio_haptics_count;
     port.next_haptics_send_time = Clock::now() + kHapticsOutputBlockedRetry;
@@ -1522,14 +1811,64 @@ bool flush_pending_audio_chunk(VirtualPort &port,
   }
 
   const auto send_duration = Clock::now() - send_start;
+  port.silent_speaker_packets =
+      chunk.has_speaker_signal
+          ? 0
+          : std::min(port.silent_speaker_packets + 1,
+                     kHapticsOnlyAfterSilentPackets);
+  port.audio_stats.haptics_only = haptics_only;
+  if (haptics_only) {
+    ++port.audio_stats.haptics_only_total;
+  }
   port.pending_audio_chunks.pop_front();
-  port.last_sent_bt_state = port.output_state.state();
+  port.audio_primed = true;
+  // 0x36 packets omit mic fields, so a pending mic mute/unmute still needs
+  // its own 0x31 state report.
+  port.last_sent_bt_state = vds::state_after_audio_packet(
+      port.last_sent_bt_state, port.output_state.state());
   if (port.pending_bt_state &&
       *port.pending_bt_state == *port.last_sent_bt_state) {
     port.pending_bt_state.reset();
     port.pending_bt_state_report.reset();
   }
-  port.next_haptics_send_time = now + kAudioOutputInterval;
+  // Step from the previous deadline to keep the packet cadence without
+  // accumulating epoll wakeup rounding. A slightly late send catches up on the
+  // next wakeup; one more than kMaxAudioCatchup late resyncs to now instead of
+  // replaying a backlog.
+  const auto sent_at = Clock::now();
+  AudioStats &stats = port.audio_stats;
+  if (stats.last_send != Clock::time_point{}) {
+    const auto gap = sent_at - stats.last_send;
+    // Longer pauses are the stream stopping, not a late packet.
+    if (gap < std::chrono::seconds(1)) {
+      const auto gap_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(gap).count();
+      stats.window_max_gap_us = std::max<std::int64_t>(stats.window_max_gap_us, gap_us);
+      const auto buffer_us =
+          static_cast<std::int64_t>(stats.buffer_length) * 1000000 /
+          VDS_HAPTICS_SAMPLE_RATE;
+      if (gap_us > buffer_us) {
+        ++stats.late_total;
+        ++stats.window_late;
+      }
+      if (stats.buffer_auto) {
+        stats.buffer_length = port.buffer_tuner.on_send(gap_us);
+        port.haptics_builder.set_buffer_length(stats.buffer_length);
+      }
+    }
+  }
+  stats.last_send = sent_at;
+  ++stats.packets_total;
+  ++stats.window_packets;
+  auto next_deadline = port.next_haptics_send_time;
+  if (next_deadline == Clock::time_point{}) {
+    next_deadline = send_start;
+  }
+  next_deadline += kAudioOutputInterval;
+  if (sent_at - next_deadline > kMaxAudioCatchup) {
+    next_deadline = sent_at + kAudioOutputInterval;
+  }
+  port.next_haptics_send_time = next_deadline;
 
   if (output_trace) {
     trace_output_latency(port.path, "audio_bt_send",
@@ -1566,6 +1905,11 @@ void enqueue_speaker_waveout_chunk(VirtualPort &port, std::uint32_t trace_flags,
     }
   }
 
+  port.waveout_extractor.set_speaker_boost_db(speaker_boost_db(port));
+  port.waveout_extractor.set_speaker_volume_percent(
+      speaker_volume_percent(port));
+  port.waveout_extractor.set_haptics_gain_percent(port.haptics_gain_percent);
+  port.waveout_extractor.set_speaker_mono(!port.headphones_plugged);
   const auto chunks = port.waveout_extractor.push_usb_audio(pcm);
   for (const auto &chunk : chunks) {
     if (port.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
@@ -1755,11 +2099,573 @@ void reconcile_controller_configs(std::vector<VirtualPort> &ports,
   controllers = std::move(next_controllers);
 }
 
+// Reads the ACL link RSSI for a connected controller through the HCI
+// device. Returns nothing when the adapter or connection handle is
+// unavailable.
+std::optional<std::int8_t> read_controller_rssi(const std::string &address) {
+  bdaddr_t bdaddr{};
+  if (str2ba(address.c_str(), &bdaddr) < 0) {
+    return std::nullopt;
+  }
+  const int dev_id = hci_get_route(&bdaddr);
+  if (dev_id < 0) {
+    return std::nullopt;
+  }
+  const int dd = hci_open_dev(dev_id);
+  if (dd < 0) {
+    return std::nullopt;
+  }
+  std::optional<std::int8_t> result;
+  std::vector<std::uint8_t> buffer(sizeof(hci_conn_info_req) +
+                                   sizeof(hci_conn_info));
+  auto *request = reinterpret_cast<hci_conn_info_req *>(buffer.data());
+  bacpy(&request->bdaddr, &bdaddr);
+  request->type = ACL_LINK;
+  if (::ioctl(dd, HCIGETCONNINFO, buffer.data()) == 0) {
+    std::int8_t rssi = 0;
+    if (hci_read_rssi(dd, htobs(request->conn_info->handle), &rssi, 200) ==
+        0) {
+      result = rssi;
+    }
+  }
+  hci_close_dev(dd);
+  return result;
+}
+
+/*
+ * Bluetooth mode. In "vds" mode bluetoothd runs with --noplugin=input and vdsd
+ * listens on the HID L2CAP PSMs. In "normal" mode vdsd closes its listeners
+ * and BlueZ's input plugin is enabled, so other Bluetooth keyboards, mice and
+ * controllers work. Switching restarts bluetoothd through the override script.
+ *
+ * With auto switching, vdsd enters normal mode once no registered controller
+ * has been connected for idle_timeout, and returns to vds mode when BlueZ
+ * reports a registered controller connected (it then has to reconnect to
+ * vdsd after the bluetoothd restart).
+ */
+constexpr auto kDefaultBluetoothIdleTimeout = std::chrono::seconds(120);
+constexpr auto kMinBluetoothIdleTimeout = std::chrono::seconds(10);
+constexpr auto kMaxBluetoothIdleTimeout = std::chrono::seconds(3600);
+constexpr auto kBluetoothModePoll = std::chrono::seconds(2);
+constexpr int kBluetoothModePollMs = 2000;
+
+struct BluetoothModeState {
+  std::string script;
+  std::string settings_path;
+  bool normal_mode = false;
+  std::optional<bool> requested_normal_mode;
+  bool auto_switch = false;
+  std::chrono::seconds idle_timeout = kDefaultBluetoothIdleTimeout;
+  Clock::time_point idle_since{};
+  Clock::time_point next_bluez_poll{};
+  Clock::time_point next_listen_retry{};
+  bool listen_error_logged = false;
+  std::string last_error;
+};
+
+void set_bluetooth_normal_mode(BluetoothModeState &state, bool normal) {
+  state.normal_mode = normal;
+  g_bluetooth_normal_mode = normal;
+}
+
+std::chrono::seconds clamp_bluetooth_idle_timeout(unsigned long seconds) {
+  return std::clamp(std::chrono::seconds(seconds), kMinBluetoothIdleTimeout,
+                    kMaxBluetoothIdleTimeout);
+}
+
+void load_bluetooth_mode_settings(BluetoothModeState &state) {
+  std::ifstream file(state.settings_path);
+  std::string line;
+  while (std::getline(file, line)) {
+    const std::size_t separator = line.find('=');
+    if (separator == std::string::npos) {
+      continue;
+    }
+    const std::string key = line.substr(0, separator);
+    const std::string value = line.substr(separator + 1);
+    if (key == "auto") {
+      state.auto_switch = value == "1";
+    } else if (key == "idle_seconds") {
+      try {
+        state.idle_timeout = clamp_bluetooth_idle_timeout(std::stoul(value));
+      } catch (const std::exception &) {
+      }
+    }
+  }
+}
+
+void save_bluetooth_mode_settings(const BluetoothModeState &state,
+                                  vds::Logger &logger) {
+  const std::string tmp_path = state.settings_path + ".tmp";
+  {
+    std::ofstream file(tmp_path, std::ios::trunc);
+    file << "auto=" << (state.auto_switch ? 1 : 0) << '\n'
+         << "idle_seconds=" << state.idle_timeout.count() << '\n';
+    if (!file) {
+      logger.log("bluetooth", vds::LogLevel::Error,
+                 "failed to write " + tmp_path);
+      return;
+    }
+  }
+  std::error_code error;
+  std::filesystem::rename(tmp_path, state.settings_path, error);
+  if (error) {
+    logger.log("bluetooth", vds::LogLevel::Error,
+               "failed to save " + state.settings_path + ": " +
+                   error.message());
+  }
+}
+
+std::string format_bluetooth_mode_reply(const BluetoothModeState &state,
+                                        bool listening, bool ok,
+                                        std::string_view error) {
+  const bool normal =
+      state.requested_normal_mode.value_or(state.normal_mode);
+  std::string reply = "{";
+  reply += vds::jsonl_bool_field("OK", ok);
+  reply += ',';
+  reply += vds::jsonl_string_field("error", error);
+  reply += ',';
+  reply += vds::jsonl_string_field("mode", normal ? "normal" : "vds");
+  reply += ',';
+  reply += vds::jsonl_bool_field(
+      "switching", state.requested_normal_mode.has_value() &&
+                       *state.requested_normal_mode != state.normal_mode);
+  reply += ',';
+  reply += vds::jsonl_bool_field("listening", listening);
+  reply += ',';
+  reply += vds::jsonl_bool_field("auto", state.auto_switch);
+  reply += ",\"idle_seconds\":" + std::to_string(state.idle_timeout.count());
+  reply += ',';
+  reply += vds::jsonl_string_field("last_error", state.last_error);
+  reply += "}\n";
+  return reply;
+}
+
+const vds::JsonlField *find_jsonl_field(std::span<const vds::JsonlField> fields,
+                                        std::string_view key) {
+  for (const auto &field : fields) {
+    if (field.key == key) {
+      return &field;
+    }
+  }
+  return nullptr;
+}
+
+std::string handle_bluetooth_mode_request(
+    std::span<const vds::JsonlField> fields, BluetoothModeState &state,
+    bool listening, vds::Logger &logger) {
+  constexpr std::string_view context = "bluetooth request";
+  try {
+    static constexpr std::string_view expected[] = {
+        "command", "op", "mode", "auto", "idle_seconds",
+    };
+    vds::reject_unknown_jsonl_fields(fields, expected, context);
+    const std::string op = vds::require_jsonl_string(fields, "op", context);
+    if (op == "get") {
+      return format_bluetooth_mode_reply(state, listening, true, "");
+    }
+    if (op != "set") {
+      throw std::runtime_error("bluetooth op must be get or set");
+    }
+
+    bool settings_changed = false;
+    if (find_jsonl_field(fields, "auto") != nullptr) {
+      const std::string value =
+          vds::require_jsonl_string(fields, "auto", context);
+      if (value != "on" && value != "off") {
+        throw std::runtime_error("bluetooth auto must be on or off");
+      }
+      state.auto_switch = value == "on";
+      state.idle_since = {};
+      settings_changed = true;
+    }
+    if (find_jsonl_field(fields, "idle_seconds") != nullptr) {
+      const std::string value =
+          vds::require_jsonl_string(fields, "idle_seconds", context);
+      if (value.empty() ||
+          value.find_first_not_of("0123456789") != std::string::npos ||
+          value.size() > 6) {
+        throw std::runtime_error("bluetooth idle_seconds must be a number");
+      }
+      state.idle_timeout = clamp_bluetooth_idle_timeout(std::stoul(value));
+      settings_changed = true;
+    }
+    if (find_jsonl_field(fields, "mode") != nullptr) {
+      const std::string mode =
+          vds::require_jsonl_string(fields, "mode", context);
+      if (mode != "normal" && mode != "vds") {
+        throw std::runtime_error("bluetooth mode must be normal or vds");
+      }
+      state.requested_normal_mode = mode == "normal";
+    }
+    if (settings_changed) {
+      save_bluetooth_mode_settings(state, logger);
+      logger.log("bluetooth", vds::LogLevel::Info,
+                 std::string("auto switching ") +
+                     (state.auto_switch ? "on" : "off") + " idle_seconds=" +
+                     std::to_string(state.idle_timeout.count()));
+    }
+    return format_bluetooth_mode_reply(state, listening, true, "");
+  } catch (const std::exception &error) {
+    return format_bluetooth_mode_reply(state, listening, false, error.what());
+  }
+}
+
+void enter_normal_bluetooth_mode(BluetoothModeState &state,
+                                 std::optional<vds::BtL2capAcceptor> &acceptor,
+                                 std::vector<VirtualPort> &ports,
+                                 std::vector<ControllerRuntime> &controllers,
+                                 vds::Logger &logger) {
+  logger.log("bluetooth", vds::LogLevel::Info,
+             "switching to normal Bluetooth mode (BlueZ input plugin on)");
+  for (auto &controller : controllers) {
+    if (const auto port_index = find_port_index(ports, controller.device)) {
+      drop_bt_backend(controller, ports[*port_index],
+                      "Bluetooth switched to normal mode", logger);
+    }
+    controller.backend.reset();
+    controller.pending_control_fd.reset();
+    controller.pending_interrupt_fd.reset();
+  }
+  acceptor.reset();
+
+  const std::string error =
+      vds::run_bluetooth_override_script(state.script, true);
+  state.last_error = error;
+  if (!error.empty()) {
+    logger.log("bluetooth", vds::LogLevel::Error,
+               "switch to normal mode failed: " + error);
+  }
+  set_bluetooth_normal_mode(state,
+                            vds::bluez_input_plugin_enabled().value_or(false));
+  state.next_bluez_poll = Clock::now() + kBluetoothModePoll;
+  state.next_listen_retry = {};
+}
+
+void enter_vds_bluetooth_mode(BluetoothModeState &state, vds::Logger &logger) {
+  logger.log("bluetooth", vds::LogLevel::Info,
+             "switching to vds Bluetooth mode (BlueZ input plugin off)");
+  const std::string error =
+      vds::run_bluetooth_override_script(state.script, false);
+  state.last_error = error;
+  if (!error.empty()) {
+    logger.log("bluetooth", vds::LogLevel::Error,
+               "switch to vds mode failed: " + error);
+  }
+  set_bluetooth_normal_mode(state,
+                            vds::bluez_input_plugin_enabled().value_or(false));
+  state.idle_since = Clock::now();
+  state.next_listen_retry = {};
+  state.listen_error_logged = false;
+}
+
+bool bluez_registered_controller_online(const std::string &db_path) {
+  const vds::ConfigDb db = vds::load_config_db(db_path);
+  for (const auto &target : vds::list_bluez_controller_targets()) {
+    if (!target.online) {
+      continue;
+    }
+    for (const auto &config : db.controllers) {
+      if (config.address == target.address) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void tick_bluetooth_mode(BluetoothModeState &state,
+                         std::optional<vds::BtL2capAcceptor> &acceptor,
+                         std::vector<VirtualPort> &ports,
+                         std::vector<ControllerRuntime> &controllers,
+                         const std::string &db_path, vds::Logger &logger,
+                         bool &epoll_dirty) {
+  if (state.requested_normal_mode) {
+    const bool normal = *state.requested_normal_mode;
+    state.requested_normal_mode.reset();
+    if (normal && !state.normal_mode) {
+      enter_normal_bluetooth_mode(state, acceptor, ports, controllers, logger);
+      epoll_dirty = true;
+    } else if (!normal && state.normal_mode) {
+      enter_vds_bluetooth_mode(state, logger);
+    }
+  }
+
+  const auto now = Clock::now();
+  if (!state.normal_mode && !acceptor && now >= state.next_listen_retry) {
+    try {
+      acceptor.emplace();
+      state.listen_error_logged = false;
+      epoll_dirty = true;
+      logger.log("bluetooth", vds::LogLevel::Info,
+                 "listening for controller-initiated raw HID channels");
+    } catch (const std::exception &error) {
+      state.next_listen_retry = now + kBluetoothModePoll;
+      if (!state.listen_error_logged) {
+        state.listen_error_logged = true;
+        logger.log("bluetooth", vds::LogLevel::Warn,
+                   std::string("cannot listen for controllers yet: ") +
+                       error.what());
+      }
+    }
+  }
+
+  if (!state.auto_switch) {
+    state.idle_since = {};
+    return;
+  }
+
+  if (!state.normal_mode) {
+    const bool active =
+        std::any_of(controllers.begin(), controllers.end(),
+                    [](const ControllerRuntime &controller) {
+                      return controller.backend || controller.virtual_connected ||
+                             controller.pending_control_fd ||
+                             controller.pending_interrupt_fd;
+                    });
+    if (active) {
+      state.idle_since = {};
+    } else if (state.idle_since == Clock::time_point{}) {
+      state.idle_since = now;
+    } else if (now - state.idle_since >= state.idle_timeout) {
+      logger.log("bluetooth", vds::LogLevel::Info,
+                 "no controller connected for " +
+                     std::to_string(state.idle_timeout.count()) +
+                     "s; auto switching to normal mode");
+      enter_normal_bluetooth_mode(state, acceptor, ports, controllers, logger);
+      epoll_dirty = true;
+    }
+    return;
+  }
+
+  if (now < state.next_bluez_poll) {
+    return;
+  }
+  state.next_bluez_poll = now + kBluetoothModePoll;
+  try {
+    if (bluez_registered_controller_online(db_path)) {
+      logger.log("bluetooth", vds::LogLevel::Info,
+                 "registered controller connected to BlueZ; auto switching "
+                 "to vds mode");
+      enter_vds_bluetooth_mode(state, logger);
+    }
+  } catch (const std::exception &error) {
+    logger.log("bluetooth", vds::LogLevel::Warn,
+               std::string("BlueZ controller poll failed: ") + error.what());
+  }
+}
+
+bool bluetooth_mode_needs_poll(const BluetoothModeState &state,
+                               const std::optional<vds::BtL2capAcceptor> &acceptor) {
+  return state.auto_switch || state.requested_normal_mode.has_value() ||
+         (!state.normal_mode && !acceptor);
+}
+
+/*
+ * `log` control command: the daemon log is root-only, so the companion app reads
+ * its tail through the socket (Diagnostics). Optional "trace": "on"|"off" with a
+ * "scope" toggles tracing in the same request.
+ */
+constexpr std::size_t kDaemonLogDefaultLines = 200;
+constexpr std::size_t kDaemonLogMaxLines = 1000;
+constexpr std::streamoff kDaemonLogTailBytes = 256 * 1024;
+
+std::vector<std::string> read_log_tail(const std::string &path,
+                                       std::size_t max_lines) {
+  std::vector<std::string> lines;
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file) {
+    return lines;
+  }
+  const std::streamoff size = file.tellg();
+  const std::streamoff start = std::max<std::streamoff>(0, size - kDaemonLogTailBytes);
+  file.seekg(start);
+  std::string line;
+  bool first = start > 0; // first line is likely partial
+  while (std::getline(file, line)) {
+    if (first) {
+      first = false;
+      continue;
+    }
+    lines.push_back(std::move(line));
+  }
+  if (lines.size() > max_lines) {
+    lines.erase(lines.begin(),
+                lines.begin() + static_cast<std::ptrdiff_t>(lines.size() - max_lines));
+  }
+  return lines;
+}
+
+std::string handle_daemon_log_request(std::span<const vds::JsonlField> fields,
+                                      const std::string &log_path,
+                                      std::uint32_t &trace_flags,
+                                      vds::Logger &logger) {
+  constexpr std::string_view context = "log request";
+  std::string reply = "{";
+  try {
+    static constexpr std::string_view expected[] = {"command", "lines", "trace",
+                                                     "scope"};
+    vds::reject_unknown_jsonl_fields(fields, expected, context);
+    std::size_t max_lines = kDaemonLogDefaultLines;
+    if (find_jsonl_field(fields, "lines") != nullptr) {
+      const std::string value = vds::require_jsonl_string(fields, "lines", context);
+      if (value.empty() || value.size() > 5 ||
+          value.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::runtime_error("log lines must be a number");
+      }
+      max_lines = std::clamp<std::size_t>(std::stoul(value), 1, kDaemonLogMaxLines);
+    }
+    if (find_jsonl_field(fields, "trace") != nullptr) {
+      const std::string mode = vds::require_jsonl_string(fields, "trace", context);
+      const std::uint32_t scope =
+          find_jsonl_field(fields, "scope") != nullptr
+              ? vds::parse_trace_scope(vds::require_jsonl_string(fields, "scope", context))
+              : vds::kTraceOutput;
+      if (mode == "on") {
+        trace_flags |= scope;
+      } else if (mode == "off") {
+        trace_flags &= ~scope;
+      } else {
+        throw std::runtime_error("log trace must be on or off");
+      }
+      logger.log("control", vds::LogLevel::Info,
+                 "trace " + vds::trace_scope_name(scope) + " " + mode +
+                     " (companion diagnostics)");
+    }
+    reply += vds::jsonl_bool_field("OK", true);
+    reply += ',';
+    reply += vds::jsonl_string_field("error", "");
+    reply += ',';
+    reply += vds::jsonl_bool_field("trace_input",
+                                   vds::trace_enabled(trace_flags, vds::kTraceInput));
+    reply += ',';
+    reply += vds::jsonl_bool_field("trace_output",
+                                   vds::trace_enabled(trace_flags, vds::kTraceOutput));
+    reply += ",\"lines\":[";
+    const std::vector<std::string> lines = read_log_tail(log_path, max_lines);
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+      if (i > 0) {
+        reply += ',';
+      }
+      reply += vds::jsonl_string_value(lines[i]);
+    }
+    reply += "]}\n";
+    return reply;
+  } catch (const std::exception &error) {
+    reply = "{";
+    reply += vds::jsonl_bool_field("OK", false);
+    reply += ',';
+    reply += vds::jsonl_string_field("error", error.what());
+    reply += "}\n";
+    return reply;
+  }
+}
+
+/*
+ * `audio` control command: per-port audio delivery stats for the companion
+ * Diagnostics view. Window counters cover the time since the previous
+ * request and are reset by it.
+ */
+std::string handle_audio_stats_request(std::span<const VirtualPort> ports,
+                                       std::span<const ControllerRuntime> controllers) {
+  const auto now = Clock::now();
+  const auto fixed = [](double value, int decimals) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(decimals) << value;
+    return out.str();
+  };
+  std::string reply = "{";
+  reply += vds::jsonl_bool_field("OK", true);
+  reply += ',';
+  reply += vds::jsonl_string_field("error", "");
+  reply += ",\"ports\":[";
+  bool first = true;
+  for (const auto &port : ports) {
+    const bool connected = std::any_of(
+        controllers.begin(), controllers.end(), [&](const ControllerRuntime &c) {
+          return c.virtual_connected && c.device == port.path;
+        });
+    if (!connected) {
+      continue;
+    }
+    AudioStats &stats = port.audio_stats;
+    const double window_s =
+        stats.window_start == Clock::time_point{}
+            ? 0.0
+            : std::chrono::duration<double>(now - stats.window_start).count();
+    const bool streaming = stats.last_send != Clock::time_point{} &&
+                           now - stats.last_send < std::chrono::milliseconds(250);
+    if (!first) {
+      reply += ',';
+    }
+    first = false;
+    reply += '{';
+    reply += vds::jsonl_string_field("path", port.path);
+    reply += ',';
+    reply += vds::jsonl_bool_field("streaming", streaming);
+    reply += ",\"buffer_length\":" + std::to_string(stats.buffer_length);
+    reply += ",\"buffer_ms\":" +
+             fixed(1000.0 * stats.buffer_length / VDS_HAPTICS_SAMPLE_RATE, 1);
+    reply += std::string(",\"buffer_auto\":") + (stats.buffer_auto ? "true" : "false");
+    reply += ",\"trims_total\":" + std::to_string(stats.trims_total);
+    reply += std::string(",\"haptics_only\":") + (stats.haptics_only ? "true" : "false");
+    reply += ",\"haptics_only_total\":" + std::to_string(stats.haptics_only_total);
+    reply += ",\"window_seconds\":" + fixed(window_s, 2);
+    reply += ",\"packets_per_second\":" +
+             fixed(window_s > 0.0 ? stats.window_packets / window_s : 0.0, 1);
+    reply += ",\"max_gap_ms\":" + fixed(stats.window_max_gap_us / 1000.0, 1);
+    reply += ",\"late\":" + std::to_string(stats.window_late);
+    reply += ",\"refills\":" + std::to_string(stats.window_refills);
+    reply += ",\"packets_total\":" + std::to_string(stats.packets_total);
+    reply += ",\"late_total\":" + std::to_string(stats.late_total);
+    reply += ",\"refills_total\":" + std::to_string(stats.refills_total);
+    reply += ",\"queue_depth\":" + std::to_string(port.pending_audio_chunks.size());
+    reply += ",\"queue_dropped_total\":" +
+             std::to_string(port.trace_state.queue_dropped_audio_haptics_count);
+    reply += ",\"blocked_total\":" +
+             std::to_string(port.trace_state.blocked_audio_haptics_count);
+    reply += ',';
+    reply += vds::jsonl_bool_field("headphones", port.headphones_plugged);
+    reply += ',';
+    reply += vds::jsonl_bool_field("speaker_mono", !port.headphones_plugged);
+    reply += ",\"speaker_boost_db\":" + fixed(speaker_boost_db(port), 1);
+    reply += ",\"speaker_volume_percent\":" +
+             std::to_string(speaker_volume_percent(port));
+    reply += ",\"haptics_gain_percent\":" +
+             std::to_string(port.haptics_gain_percent);
+    reply += '}';
+    stats.window_start = now;
+    stats.window_packets = 0;
+    stats.window_late = 0;
+    stats.window_refills = 0;
+    stats.window_max_gap_us = 0;
+  }
+  reply += "]}\n";
+  return reply;
+}
+
+std::optional<std::string> parse_bluetooth_mode_command(
+    const std::string &command, std::vector<vds::JsonlField> &fields) {
+  try {
+    fields = vds::parse_jsonl_object(command, "control request");
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+  const vds::JsonlField *field = find_jsonl_field(fields, "command");
+  if (field == nullptr || field->value.is_array) {
+    return std::nullopt;
+  }
+  return field->value.string_value;
+}
+
 void handle_control_client(int control_fd, std::span<const VirtualPort> ports,
                            std::span<const ControllerRuntime> controllers,
                            const std::string &db_path,
                            std::uint32_t &trace_flags, bool &reload_requested,
-                           vds::Logger &logger) {
+                           vds::CompanionRuntime &companion,
+                           BluetoothModeState &bt_mode, bool bt_listening,
+                           const std::string &log_path, vds::Logger &logger) {
   vds::UniqueFd client_fd(
       ::accept4(control_fd, nullptr, nullptr, SOCK_CLOEXEC));
   if (!client_fd) {
@@ -1770,29 +2676,80 @@ void handle_control_client(int control_fd, std::span<const VirtualPort> ports,
                              std::string(std::strerror(errno)));
   }
 
-  std::array<char, 256> buffer{};
-  ssize_t got = 0;
-  do {
-    got = ::read(client_fd.get(), buffer.data(), buffer.size() - 1);
-  } while (got < 0 && errno == EINTR);
-  if (got < 0) {
-    throw std::runtime_error("read control client failed: " +
-                             std::string(std::strerror(errno)));
+  // Companion requests carry a 64-byte report as a JSON array, so a request
+  // line can exceed a single small read; accumulate until newline or EOF.
+  constexpr std::size_t kMaxControlRequest = 8192;
+  std::array<char, 512> buffer{};
+  std::string request;
+  while (request.find('\n') == std::string::npos &&
+         request.size() < kMaxControlRequest) {
+    ssize_t got = 0;
+    do {
+      got = ::read(client_fd.get(), buffer.data(), buffer.size());
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+      throw std::runtime_error("read control client failed: " +
+                               std::string(std::strerror(errno)));
+    }
+    if (got == 0) {
+      break;
+    }
+    request.append(buffer.data(), static_cast<std::size_t>(got));
   }
-  if (got <= 0) {
+  if (request.empty()) {
     return;
   }
 
   std::string reply;
-  const std::string command =
-      trim_command(std::string(buffer.data(), static_cast<std::size_t>(got)));
+  const std::string command = trim_command(std::move(request));
+  std::vector<vds::JsonlField> fields;
+  const std::optional<std::string> local_command =
+      parse_bluetooth_mode_command(command, fields);
+  if (local_command == "audio") {
+    reply = handle_audio_stats_request(ports, controllers);
+    try {
+      vds::write_full(client_fd.get(), reply);
+    } catch (const std::exception &error) {
+      logger.log("control", vds::LogLevel::Error,
+                 std::string("reply failed: ") + error.what());
+    }
+    return;
+  }
+  if (local_command == "bluetooth" || local_command == "log") {
+    reply = local_command == "bluetooth"
+                ? handle_bluetooth_mode_request(fields, bt_mode, bt_listening, logger)
+                : handle_daemon_log_request(fields, log_path, trace_flags, logger);
+    try {
+      vds::write_full(client_fd.get(), reply);
+    } catch (const std::exception &error) {
+      logger.log("control", vds::LogLevel::Error,
+                 std::string("reply failed: ") + error.what());
+    }
+    return;
+  }
   std::vector<vds::VdsdControlControllerStatus> controller_statuses;
   controller_statuses.reserve(controllers.size());
   for (const auto &controller : controllers) {
+    std::uint8_t battery_status = 0xff;
+    if (controller.virtual_connected) {
+      for (const auto &port : ports) {
+        if (port.path == controller.device) {
+          battery_status = port.battery_status;
+          break;
+        }
+      }
+    }
+    std::optional<std::int8_t> rssi;
+    if (controller.virtual_connected) {
+      rssi = read_controller_rssi(controller.config.address);
+    }
     controller_statuses.push_back(vds::VdsdControlControllerStatus{
         .address = controller.config.address,
         .connected = controller.virtual_connected,
         .path = controller.virtual_connected ? controller.device : "",
+        .battery_status = battery_status,
+        .rssi_valid = rssi.has_value(),
+        .rssi = rssi.value_or(0),
     });
   }
 
@@ -1833,7 +2790,7 @@ void handle_control_client(int control_fd, std::span<const VirtualPort> ports,
   reply = vds::handle_vdsd_control_command(
       command, db_path, controller_statuses, port_statuses,
       [] { return vds::list_bluez_controller_targets(); }, trace_flags,
-      reload_requested, logger);
+      reload_requested, companion, logger);
 
   try {
     vds::write_full(client_fd.get(), reply);
@@ -1841,6 +2798,365 @@ void handle_control_client(int control_fd, std::span<const VirtualPort> ports,
     if (trace_flags != 0) {
       logger.log("control", vds::LogLevel::Error,
                  std::string("reply failed: ") + error.what());
+    }
+  }
+}
+
+// Grabs every DualSense touchpad evdev node (EVIOCGRAB) so the compositor
+// stops receiving pointer events from it; raw HID touch used by games is
+// unaffected. Returns the grabbed fds.
+std::vector<vds::UniqueFd> grab_dualsense_touchpads(vds::Logger &logger) {
+  std::vector<vds::UniqueFd> grabs;
+  DIR *dir = ::opendir("/dev/input");
+  if (dir == nullptr) {
+    return grabs;
+  }
+  while (const dirent *entry = ::readdir(dir)) {
+    if (std::strncmp(entry->d_name, "event", 5) != 0) {
+      continue;
+    }
+    const std::string node = std::string("/dev/input/") + entry->d_name;
+    vds::UniqueFd fd(::open(node.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
+    if (!fd) {
+      continue;
+    }
+    char name[256] = {};
+    if (::ioctl(fd.get(), EVIOCGNAME(sizeof(name) - 1), name) < 0) {
+      continue;
+    }
+    if (std::strstr(name, "DualSense") == nullptr ||
+        std::strstr(name, "Touchpad") == nullptr) {
+      continue;
+    }
+    if (::ioctl(fd.get(), EVIOCGRAB, 1) < 0) {
+      logger.log("companion", vds::LogLevel::Warn,
+                 node + " touchpad grab failed: " +
+                     std::string(std::strerror(errno)));
+      continue;
+    }
+    logger.log("companion", vds::LogLevel::Info,
+               node + " touchpad pointer grabbed (" + name + ")");
+    grabs.push_back(std::move(fd));
+  }
+  ::closedir(dir);
+  return grabs;
+}
+
+// Translates companion settings and momentary effects into per-port output
+// overrides, then forwards the resulting BT state to connected controllers.
+const char *host_persona_name(vds::HostPersona persona) {
+  switch (persona) {
+  case vds::HostPersona::Ds4:
+    return "ds4";
+  case vds::HostPersona::Xbox360:
+    return "xbox360";
+  case vds::HostPersona::DualSense:
+    break;
+  }
+  return "dualsense";
+}
+
+// Re-enumerates the virtual USB controller with the persona's profile while
+// keeping the Bluetooth link to the DualSense up.
+void switch_port_persona(VirtualPort &port, ControllerRuntime &controller,
+                         vds::HostPersona persona, vds::Logger &logger) {
+  const std::uint32_t dualsense_profile =
+      controller.detected_profile.value_or(VDS_PROFILE_DS5);
+  try {
+    ioctl_noarg(port.fd.get(), VDS_IOC_DISCONNECT, "VDS_IOC_DISCONNECT");
+    ioctl_set_profile(port.fd.get(),
+                      vds::usb_profile_for_persona(persona, dualsense_profile));
+    port.persona = persona;
+    port.persona_state = {};
+    port.pending_audio_chunks.clear();
+    port.audio_primed = false;
+    port.extractor = vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
+    ioctl_noarg(port.fd.get(), VDS_IOC_CONNECT, "VDS_IOC_CONNECT");
+    logger.log("companion", vds::LogLevel::Info,
+               port.path + " host persona " + host_persona_name(persona));
+  } catch (const std::exception &error) {
+    logger.log("companion", vds::LogLevel::Error,
+               port.path + " host persona switch failed: " + error.what());
+  }
+}
+
+std::string process_name(pid_t pid) {
+  std::ifstream comm("/proc/" + std::to_string(pid) + "/comm");
+  std::string name;
+  std::getline(comm, name);
+  return name.empty() ? "?" : name;
+}
+
+std::optional<std::size_t> port_index_from_path(const std::string &path) {
+  constexpr std::string_view prefix = "/dev/vds";
+  if (path.rfind(prefix, 0) != 0 || path.size() == prefix.size()) {
+    return std::nullopt;
+  }
+  try {
+    return static_cast<std::size_t>(std::stoul(path.substr(prefix.size())));
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+}
+
+void clear_host_watch(VirtualPort &port, int inotify_fd) {
+  if (port.hidraw_watch >= 0 && inotify_fd >= 0) {
+    ::inotify_rm_watch(inotify_fd, port.hidraw_watch);
+  }
+  port.hidraw_watch = -1;
+  port.hidraw_node.clear();
+  port.host_baseline.clear();
+  port.host_sessions.clear();
+}
+
+// Attaches the hidraw watch once a bridged controller's node exists; drops
+// it when the controller goes away.
+void refresh_host_watches(std::vector<VirtualPort> &ports,
+                          std::vector<ControllerRuntime> &controllers,
+                          int inotify_fd, vds::Logger &logger) {
+  for (auto &port : ports) {
+    const ControllerRuntime *controller = controller_for_port(controllers, port.path);
+    const bool connected = controller != nullptr && controller->virtual_connected;
+    if (!connected) {
+      if (port.hidraw_watch >= 0) {
+        clear_host_watch(port, inotify_fd);
+      }
+      continue;
+    }
+    if (port.hidraw_watch >= 0) {
+      continue;
+    }
+    const auto index = port_index_from_path(port.path);
+    const auto node = index ? vds::find_port_hidraw(*index) : std::nullopt;
+    if (!node) {
+      continue;
+    }
+    const int watch = ::inotify_add_watch(inotify_fd, node->c_str(),
+                                          IN_OPEN | IN_CLOSE);
+    if (watch < 0) {
+      continue;
+    }
+    port.hidraw_node = *node;
+    port.hidraw_watch = watch;
+    port.host_baseline = vds::node_openers(*node, ::getpid());
+    port.host_sessions.clear();
+    logger.log("host", vds::LogLevel::Info,
+               port.path + " watching " + *node + " for native game sessions");
+  }
+}
+
+// Re-checks who has the port's hidraw node open after an open/close.
+void update_host_session(VirtualPort &port, ControllerRuntime *controller,
+                         std::uint32_t trace_flags, vds::Logger &logger) {
+  const std::set<pid_t> openers = vds::node_openers(port.hidraw_node, ::getpid());
+  std::erase_if(port.host_baseline,
+                [&](pid_t pid) { return !openers.contains(pid); });
+
+  // Programs that closed it: the latest one restores the state from before it
+  // opened; an earlier one hands its (older) snapshot to the next in line.
+  bool restored = false;
+  for (std::size_t i = port.host_sessions.size(); i-- > 0;) {
+    if (openers.contains(port.host_sessions[i].pid)) {
+      continue;
+    }
+    const auto session = port.host_sessions[i];
+    port.host_sessions.erase(port.host_sessions.begin() +
+                             static_cast<std::ptrdiff_t>(i));
+    logger.log("host", vds::LogLevel::Info,
+               port.path + " pid " + std::to_string(session.pid) +
+                   " closed the controller");
+    if (i == port.host_sessions.size()) {
+      port.output_state.restore_host_state(session.before);
+      restored = true;
+    } else {
+      port.host_sessions[i].before = session.before;
+    }
+  }
+
+  for (const pid_t pid : openers) {
+    const bool known =
+        port.host_baseline.contains(pid) ||
+        std::any_of(port.host_sessions.begin(), port.host_sessions.end(),
+                    [&](const VirtualPort::HostSession &session) {
+                      return session.pid == pid;
+                    });
+    if (known) {
+      continue;
+    }
+    port.host_sessions.push_back({pid, port.output_state.host_state()});
+    logger.log("host", vds::LogLevel::Info,
+               port.path + " " + process_name(pid) + " (pid " +
+                   std::to_string(pid) + ") opened the controller");
+  }
+
+  if (restored) {
+    logger.log("host", vds::LogLevel::Info,
+               port.path + " restored lights and output state after a native "
+                           "game closed the controller");
+    if (controller != nullptr && controller->backend) {
+      try {
+        forward_bt_state_if_changed(port, *controller->backend, trace_flags,
+                                    logger, "native game closed");
+      } catch (const std::exception &error) {
+        logger.log("host", vds::LogLevel::Warn,
+                   port.path + " restore send failed: " + error.what());
+      }
+    }
+  }
+}
+
+/*
+ * "Turn Off Controller": close vdsd's L2CAP channels, then drop the Bluetooth
+ * link through BlueZ. A DualSense powers itself off when the host
+ * disconnects it; pressing PS turns it back on and it reconnects.
+ */
+void power_off_controllers(std::vector<VirtualPort> &ports,
+                           std::vector<ControllerRuntime> &controllers,
+                           vds::Logger &logger) {
+  for (auto &controller : controllers) {
+    if (!controller.backend && !controller.virtual_connected) {
+      continue;
+    }
+    const std::string address = controller.config.address;
+    auto port = std::find_if(ports.begin(), ports.end(), [&](const VirtualPort &p) {
+      return p.path == controller.device;
+    });
+    if (port != ports.end()) {
+      drop_bt_backend(controller, *port, "turned off from the companion app",
+                      logger);
+    }
+    try {
+      if (!vds::disconnect_bluez_device(address)) {
+        logger.log("bluetooth", vds::LogLevel::Warn,
+                   "turn off: BlueZ device not found address=" + address);
+      }
+    } catch (const std::exception &error) {
+      logger.log("bluetooth", vds::LogLevel::Warn,
+                 "turn off: BlueZ disconnect failed address=" + address +
+                     " error=" + error.what());
+    }
+    logger.log("bluetooth", vds::LogLevel::Info,
+               "controller turned off address=" + address);
+  }
+}
+
+void apply_companion_state(std::vector<VirtualPort> &ports,
+                           std::vector<ControllerRuntime> &controllers,
+                           vds::CompanionRuntime &companion,
+                           std::uint32_t trace_flags, vds::Logger &logger) {
+  (void)vds::expire_companion_actuation(companion,
+                                        std::chrono::steady_clock::now());
+
+  if (companion.actuation.power_off_pending) {
+    companion.actuation.power_off_pending = false;
+    power_off_controllers(ports, controllers, logger);
+  }
+
+  const vds::CompanionSettings &settings = companion.settings;
+  const vds::CompanionActuation &actuation = companion.actuation;
+
+  g_host_persona = vds::host_persona_from_value(settings.host_persona_mode)
+                       .value_or(vds::HostPersona::DualSense);
+  for (auto &port : ports) {
+    ControllerRuntime *controller =
+        controller_for_port(controllers, port.path);
+    if (controller != nullptr && controller->virtual_connected &&
+        port.persona != g_host_persona) {
+      switch_port_persona(port, *controller, g_host_persona, logger);
+    }
+  }
+
+  vds::DsCompanionOverrides overrides;
+  overrides.lightbar_override = settings.lightbar_override_enabled;
+  overrides.lightbar_color = {settings.lightbar_red, settings.lightbar_green,
+                              settings.lightbar_blue};
+  overrides.lightbar_brightness_percent = settings.lightbar_brightness_percent;
+  overrides.player_led_enabled = settings.player_led_enabled;
+  overrides.classic_rumble_gain_percent = settings.classic_rumble_gain_percent;
+  overrides.classic_rumble_v1 = settings.classic_rumble_v1;
+  overrides.trigger_intensity_percent =
+      settings.trigger_effect_intensity_percent;
+  overrides.speaker_volume_percent = settings.speaker_volume_percent;
+  overrides.speaker_gain_level = settings.speaker_gain_level;
+  overrides.test_rumble_active = actuation.test_rumble_active;
+  overrides.test_rumble_power = actuation.test_rumble_power;
+
+  if (actuation.test_trigger.active) {
+    const vds::CompanionTriggerEffect &effect = actuation.test_trigger;
+    // Target: 0 both, 1 left, 2 right (DS5 Bridge firmware convention).
+    if (effect.target != 2) {
+      overrides.left_trigger_active = true;
+      vds::encode_companion_trigger_effect_v2(
+          std::span<std::uint8_t, vds::kTriggerEffectSize>(
+              overrides.left_trigger),
+          effect);
+    }
+    if (effect.target != 1) {
+      overrides.right_trigger_active = true;
+      vds::encode_companion_trigger_effect_v2(
+          std::span<std::uint8_t, vds::kTriggerEffectSize>(
+              overrides.right_trigger),
+          effect);
+    }
+  } else {
+    // Persistent effects are stored per trigger; render each independently.
+    const vds::CompanionTriggerEffect &left =
+        actuation.persistent_trigger_left;
+    if (left.active) {
+      overrides.left_trigger_active = true;
+      vds::encode_companion_trigger_effect_v2(
+          std::span<std::uint8_t, vds::kTriggerEffectSize>(
+              overrides.left_trigger),
+          left);
+    }
+    const vds::CompanionTriggerEffect &right =
+        actuation.persistent_trigger_right;
+    if (right.active) {
+      overrides.right_trigger_active = true;
+      vds::encode_companion_trigger_effect_v2(
+          std::span<std::uint8_t, vds::kTriggerEffectSize>(
+              overrides.right_trigger),
+          right);
+    }
+  }
+
+  // Touchpad pointer suppression lives for the daemon lifetime alongside
+  // the companion runtime state.
+  static std::vector<vds::UniqueFd> touchpad_grabs;
+  bool any_connected = false;
+  for (const auto &controller : controllers) {
+    any_connected = any_connected || controller.virtual_connected;
+  }
+  if (!settings.touchpad_pointer_enabled && any_connected) {
+    if (touchpad_grabs.empty()) {
+      touchpad_grabs = grab_dualsense_touchpads(logger);
+    }
+  } else if (!touchpad_grabs.empty()) {
+    touchpad_grabs.clear();
+    logger.log("companion", vds::LogLevel::Info,
+               "touchpad pointer released");
+  }
+
+  for (auto &port : ports) {
+    ControllerRuntime *controller =
+        controller_for_port(controllers, port.path);
+    if (controller == nullptr || !controller->backend ||
+        !controller->virtual_connected) {
+      continue;
+    }
+    port.haptics_gain_percent = settings.haptics_gain_percent;
+    port.audio_stats.buffer_auto = settings.haptics_buffer_auto;
+    port.audio_stats.buffer_length = settings.haptics_buffer_auto
+                                         ? port.buffer_tuner.buffer_length()
+                                         : settings.haptics_buffer_length;
+    port.haptics_builder.set_buffer_length(port.audio_stats.buffer_length);
+    port.output_state.set_companion_overrides(overrides);
+    try {
+      forward_bt_state_if_changed(port, *controller->backend, trace_flags,
+                                  logger, "companion update");
+    } catch (const std::exception &error) {
+      logger.log("companion", vds::LogLevel::Warn,
+                 port.path + " companion state send failed: " + error.what());
     }
   }
 }
@@ -1867,10 +3183,12 @@ void add_epoll_fd(int epoll_fd, int fd, EventKind kind, std::size_t index) {
   }
 }
 
-vds::UniqueFd rebuild_epoll(int control_fd, vds::BtL2capAcceptor &bt_acceptor,
+vds::UniqueFd rebuild_epoll(int control_fd,
+                            const std::optional<vds::BtL2capAcceptor> &bt_acceptor,
                             const vds::VdsDeviceMonitor &vds_monitor,
                             std::span<VirtualPort> ports,
-                            std::span<ControllerRuntime> controllers) {
+                            std::span<ControllerRuntime> controllers,
+                            int sleep_fd, int host_watch_fd) {
   vds::UniqueFd epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
   if (!epoll_fd) {
     throw std::runtime_error("epoll_create1 failed: " +
@@ -1879,10 +3197,18 @@ vds::UniqueFd rebuild_epoll(int control_fd, vds::BtL2capAcceptor &bt_acceptor,
 
   add_epoll_fd(epoll_fd.get(), control_fd, EventKind::Control, 0);
   add_epoll_fd(epoll_fd.get(), vds_monitor.fd(), EventKind::Udev, 0);
-  add_epoll_fd(epoll_fd.get(), bt_acceptor.control_listener_fd(),
-               EventKind::BtAcceptControl, 0);
-  add_epoll_fd(epoll_fd.get(), bt_acceptor.interrupt_listener_fd(),
-               EventKind::BtAcceptInterrupt, 0);
+  if (sleep_fd >= 0) {
+    add_epoll_fd(epoll_fd.get(), sleep_fd, EventKind::Sleep, 0);
+  }
+  if (host_watch_fd >= 0) {
+    add_epoll_fd(epoll_fd.get(), host_watch_fd, EventKind::HostWatch, 0);
+  }
+  if (bt_acceptor) {
+    add_epoll_fd(epoll_fd.get(), bt_acceptor->control_listener_fd(),
+                 EventKind::BtAcceptControl, 0);
+    add_epoll_fd(epoll_fd.get(), bt_acceptor->interrupt_listener_fd(),
+                 EventKind::BtAcceptInterrupt, 0);
+  }
   for (std::size_t i = 0; i < ports.size(); ++i) {
     add_epoll_fd(epoll_fd.get(), ports[i].fd.get(), EventKind::Port, i);
   }
@@ -1926,6 +3252,9 @@ int main(int argc, char **argv) {
     logger.log("daemon", vds::LogLevel::Info,
                "started socket=" + options.socket + " log=" + options.log_path +
                    " db=" + options.db_path);
+    g_speaker_boost_db = options.speaker_boost_db;
+    logger.log("audio", vds::LogLevel::Info,
+               "speaker boost " + std::to_string(g_speaker_boost_db) + " dB");
     if (vds::discover_vds_devices().empty()) {
       logger.log("port", vds::LogLevel::Error,
                  std::string(kVirtualPortProviderUnavailableReason) +
@@ -1934,10 +3263,35 @@ int main(int argc, char **argv) {
     }
 
     vds::UniqueFd control_fd(open_control_socket(options.socket));
-    vds::BtL2capAcceptor bt_acceptor;
+    std::optional<vds::BtL2capAcceptor> bt_acceptor;
     vds::VdsDeviceMonitor vds_monitor;
+    BluetoothModeState bt_mode;
+    // PC Sleep Disconnect: logind PrepareForSleep + a delay inhibitor held
+    // only while the companion setting is on.
+    std::optional<vds::SleepWatcher> sleep_watcher;
+    bool system_sleeping = false;
+    vds::UniqueFd host_watch_fd(::inotify_init1(IN_NONBLOCK | IN_CLOEXEC));
+    auto next_host_watch_refresh = Clock::now();
+    try {
+      sleep_watcher.emplace();
+    } catch (const std::exception &error) {
+      logger.log("power", vds::LogLevel::Warn,
+                 std::string("PC sleep disconnect unavailable: ") + error.what());
+    }
+    bt_mode.script = options.bluetooth_override_script;
+    bt_mode.settings_path =
+        (std::filesystem::path(options.db_path).parent_path() /
+         "bluetooth-mode")
+            .string();
+    load_bluetooth_mode_settings(bt_mode);
+    set_bluetooth_normal_mode(bt_mode,
+                              vds::bluez_input_plugin_enabled().value_or(false));
     logger.log("bluetooth", vds::LogLevel::Info,
-               "listening for controller-initiated raw HID channels");
+               std::string("Bluetooth mode=") +
+                   (bt_mode.normal_mode ? "normal" : "vds") +
+                   " auto=" + (bt_mode.auto_switch ? "on" : "off") +
+                   " idle_seconds=" +
+                   std::to_string(bt_mode.idle_timeout.count()));
     SocketPathGuard control_socket_path(options.socket);
     std::vector<VirtualPort> ports;
     std::vector<ControllerRuntime> controllers;
@@ -1945,6 +3299,8 @@ int main(int argc, char **argv) {
     std::uint32_t trace_flags = 0;
     bool reload_requested = true;
     bool epoll_dirty = true;
+    vds::CompanionRuntime companion;
+    std::uint64_t applied_companion_version = 0;
 
     while (g_stop_requested == 0) {
       if (reload_requested) {
@@ -1959,14 +3315,60 @@ int main(int argc, char **argv) {
         reload_requested = false;
       }
 
+      tick_bluetooth_mode(bt_mode, bt_acceptor, ports, controllers,
+                          options.db_path, logger, epoll_dirty);
+
       if (epoll_dirty || !epoll_fd) {
         epoll_fd = rebuild_epoll(control_fd.get(), bt_acceptor, vds_monitor,
-                                 ports, controllers);
+                                 ports, controllers,
+                                 sleep_watcher ? sleep_watcher->fd() : -1,
+                                 host_watch_fd.get());
         epoll_dirty = false;
       }
 
+      if (host_watch_fd && Clock::now() >= next_host_watch_refresh) {
+        refresh_host_watches(ports, controllers, host_watch_fd.get(), logger);
+        next_host_watch_refresh = Clock::now() + std::chrono::seconds(2);
+      }
       std::array<epoll_event, 64> events{};
-      const int timeout_ms = next_wakeup_timeout_ms(ports, controllers);
+      int timeout_ms = next_wakeup_timeout_ms(ports, controllers);
+      if (host_watch_fd) {
+        timeout_ms = timeout_ms < 0 ? 2000 : std::min(timeout_ms, 2000);
+      }
+      if (bluetooth_mode_needs_poll(bt_mode, bt_acceptor)) {
+        timeout_ms = timeout_ms < 0
+                         ? kBluetoothModePollMs
+                         : std::min(timeout_ms, kBluetoothModePollMs);
+      }
+      if (const auto deadline =
+              vds::next_companion_actuation_deadline(companion)) {
+        const auto until = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               *deadline - std::chrono::steady_clock::now())
+                               .count();
+        const int deadline_ms = static_cast<int>(std::max<long long>(until, 0));
+        if (timeout_ms < 0 || deadline_ms < timeout_ms) {
+          timeout_ms = deadline_ms;
+        }
+      }
+      // Hold logind's sleep delay lock only while PC Sleep Disconnect is on
+      // (and not mid-suspend), so sleep is never delayed otherwise.
+      if (sleep_watcher) {
+        const bool want = companion.settings.usb_suspend_disconnect_enabled &&
+                          !system_sleeping;
+        if (want && !sleep_watcher->inhibitor_held()) {
+          try {
+            sleep_watcher->acquire_inhibitor();
+          } catch (const std::exception &error) {
+            logger.log("power", vds::LogLevel::Warn,
+                       std::string("sleep inhibitor unavailable: ") +
+                           error.what());
+            sleep_watcher.reset();
+            epoll_dirty = true;
+          }
+        } else if (!want && sleep_watcher->inhibitor_held()) {
+          sleep_watcher->release_inhibitor();
+        }
+      }
       const int ready =
           ::epoll_wait(epoll_fd.get(), events.data(),
                        static_cast<int>(events.size()), timeout_ms);
@@ -1977,6 +3379,18 @@ int main(int argc, char **argv) {
         throw std::runtime_error("epoll_wait failed: " +
                                  std::string(std::strerror(errno)));
       }
+      const auto companion_deadline =
+          vds::next_companion_actuation_deadline(companion);
+      const bool companion_due =
+          companion.actuation.version != applied_companion_version ||
+          (companion_deadline &&
+           std::chrono::steady_clock::now() >= *companion_deadline);
+      if (companion_due) {
+        apply_companion_state(ports, controllers, companion, trace_flags,
+                              logger);
+        applied_companion_version = companion.actuation.version;
+      }
+
       if (ready == 0) {
         flush_pending_outputs(ports, controllers, trace_flags, logger,
                               epoll_dirty);
@@ -1991,7 +3405,9 @@ int main(int argc, char **argv) {
           if ((revents & EPOLLIN) != 0) {
             handle_control_client(control_fd.get(), ports, controllers,
                                   options.db_path, trace_flags,
-                                  reload_requested, logger);
+                                  reload_requested, companion, bt_mode,
+                                  bt_acceptor.has_value(), options.log_path,
+                                  logger);
           }
           if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
             throw std::runtime_error("control socket epoll error");
@@ -2001,13 +3417,66 @@ int main(int argc, char **argv) {
 
         if (source.kind == EventKind::BtAcceptControl ||
             source.kind == EventKind::BtAcceptInterrupt) {
-          if ((revents & EPOLLIN) != 0) {
-            handle_bt_accept(ports, controllers, bt_acceptor,
+          if ((revents & EPOLLIN) != 0 && bt_acceptor) {
+            handle_bt_accept(ports, controllers, *bt_acceptor,
                              source.kind == EventKind::BtAcceptControl, logger,
                              epoll_dirty);
           }
           if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
             throw std::runtime_error("Bluetooth listener epoll error");
+          }
+          continue;
+        }
+
+        if (source.kind == EventKind::HostWatch) {
+          std::array<char, 4096> buffer{};
+          std::set<int> touched;
+          for (;;) {
+            const ssize_t length =
+                ::read(host_watch_fd.get(), buffer.data(), buffer.size());
+            if (length <= 0) {
+              break;
+            }
+            for (ssize_t offset = 0; offset < length;) {
+              const auto *event =
+                  reinterpret_cast<const inotify_event *>(buffer.data() + offset);
+              touched.insert(event->wd);
+              if ((event->mask & IN_IGNORED) != 0) {
+                for (auto &port : ports) {
+                  if (port.hidraw_watch == event->wd) {
+                    port.hidraw_watch = -1; // node removed; refresh re-attaches
+                    port.hidraw_node.clear();
+                  }
+                }
+              }
+              offset += static_cast<ssize_t>(sizeof(inotify_event) + event->len);
+            }
+          }
+          for (auto &port : ports) {
+            if (port.hidraw_watch >= 0 && touched.contains(port.hidraw_watch)) {
+              update_host_session(port, controller_for_port(controllers, port.path),
+                                  trace_flags, logger);
+            }
+          }
+          continue;
+        }
+
+        if (source.kind == EventKind::Sleep) {
+          if (sleep_watcher) {
+            for (const bool going_to_sleep : sleep_watcher->drain()) {
+              system_sleeping = going_to_sleep;
+              if (!going_to_sleep) {
+                logger.log("power", vds::LogLevel::Info, "system resumed");
+                continue;
+              }
+              if (companion.settings.usb_suspend_disconnect_enabled) {
+                logger.log("power", vds::LogLevel::Info,
+                           "system going to sleep; turning controller off");
+                power_off_controllers(ports, controllers, logger);
+                epoll_dirty = true;
+              }
+              sleep_watcher->release_inhibitor();
+            }
           }
           continue;
         }
@@ -2104,8 +3573,8 @@ int main(int argc, char **argv) {
           if ((revents & EPOLLIN) != 0) {
             for (int packet = 0; packet < kMaxBtPacketsPerWake; ++packet) {
               try {
-                if (!handle_bt_input(port, *controller.backend, trace_flags,
-                                     logger)) {
+                if (!handle_bt_input(port, *controller.backend, companion,
+                                     trace_flags, logger)) {
                   break;
                 }
               } catch (const std::exception &error) {
@@ -2124,6 +3593,15 @@ int main(int argc, char **argv) {
             epoll_dirty = true;
           }
         }
+      }
+
+      // epoll_dirty doubles as a connection-change signal so fresh
+      // controllers receive the current companion state.
+      if (companion.actuation.version != applied_companion_version ||
+          epoll_dirty) {
+        apply_companion_state(ports, controllers, companion, trace_flags,
+                              logger);
+        applied_companion_version = companion.actuation.version;
       }
 
       flush_pending_outputs(ports, controllers, trace_flags, logger,

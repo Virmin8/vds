@@ -44,7 +44,7 @@ add_custom_target(
   COMMENT "Generating vDS build info header"
   VERBATIM)
 
-add_library(vds_protocol OBJECT src/vds_protocol.cc)
+add_library(vds_protocol OBJECT src/vds_protocol.cc src/vds_persona.cc)
 target_include_directories(
   vds_protocol PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                       ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -87,7 +87,7 @@ add_library(vdsctl_common OBJECT src/vdsctl_common.cc)
 target_include_directories(vdsctl_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(vdsctl_common PUBLIC jsonl vds_config)
 
-add_library(vdsd_common OBJECT src/vdsd_common.cc)
+add_library(vdsd_common OBJECT src/vdsd_common.cc src/vds_companion.cc)
 target_include_directories(
   vdsd_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                      ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -144,7 +144,10 @@ else()
   target_link_libraries(vds_udev PUBLIC vds_config vds_common vds_io
                                         PkgConfig::UDEV)
 
-  add_executable(vdsd src/platform/linux/vdsd.cc)
+  add_executable(vdsd src/platform/linux/vdsd.cc
+                      src/platform/linux/vds_bt_mode.cc
+                      src/platform/linux/vds_sleep_watch.cc
+                      src/platform/linux/vds_host_watch.cc)
   add_dependencies(vdsd vds_build_info_header)
   target_include_directories(vdsd PRIVATE ${VDS_GENERATED_DIR})
   target_link_libraries(
@@ -173,6 +176,46 @@ else()
             vdsctl_common
             vds_udev)
 endif()
+
+add_executable(trigger_effect_v2_test tests/trigger_effect_v2_test.cc)
+target_link_libraries(trigger_effect_v2_test PRIVATE vds_protocol)
+
+add_executable(speaker_gain_test tests/speaker_gain_test.cc)
+target_link_libraries(speaker_gain_test PRIVATE vds_protocol)
+
+add_executable(bt_input_report_test tests/bt_input_report_test.cc)
+target_link_libraries(bt_input_report_test PRIVATE vds_protocol)
+
+add_executable(persona_test tests/persona_test.cc)
+target_link_libraries(persona_test PRIVATE vds_protocol)
+
+add_executable(speaker_resampler_test tests/speaker_resampler_test.cc)
+target_link_libraries(speaker_resampler_test PRIVATE vds_protocol)
+
+add_executable(speaker_enhancer_test tests/speaker_enhancer_test.cc)
+target_link_libraries(speaker_enhancer_test PRIVATE vds_protocol)
+
+add_executable(haptics_resampler_test tests/haptics_resampler_test.cc)
+target_link_libraries(haptics_resampler_test PRIVATE vds_protocol)
+
+add_executable(speaker_mono_test tests/speaker_mono_test.cc)
+target_link_libraries(speaker_mono_test PRIVATE vds_protocol)
+
+add_executable(rumble_mode_test tests/rumble_mode_test.cc)
+target_link_libraries(rumble_mode_test PRIVATE vds_protocol)
+
+add_executable(audio_pacing_test tests/audio_pacing_test.cc)
+target_link_libraries(audio_pacing_test PRIVATE vds_protocol)
+
+enable_testing()
+foreach(vds_test trigger_effect_v2_test speaker_gain_test bt_input_report_test
+                 persona_test speaker_resampler_test
+                 speaker_enhancer_test haptics_resampler_test
+                 speaker_mono_test rumble_mode_test audio_pacing_test)
+  # The tests use assert(); keep them active in Release builds too.
+  target_compile_options(${vds_test} PRIVATE -UNDEBUG)
+  add_test(NAME ${vds_test} COMMAND ${vds_test})
+endforeach()
 
 if(WIN32)
   set(VDS_RUNTIME_INSTALL_DIR ".")
@@ -306,4 +349,22 @@ else()
       uninstall COMMAND ${CMAKE_COMMAND} -E rm -f ${VDS_INSTALLED_VDSD}
                         ${VDS_INSTALLED_VDSCTL})
   endif()
+endif()
+
+# Bluetooth vs USB audio fidelity measurement (dev tool, not installed).
+add_executable(vds_audio_compare tools/audio_compare.cc)
+target_link_libraries(vds_audio_compare PRIVATE vds_protocol ${VDS_OPUS_TARGET})
+
+if(NOT WIN32)
+  add_executable(controller_shortcut_test tests/controller_shortcut_test.cc)
+  target_link_libraries(controller_shortcut_test PRIVATE vdsd_common vds_protocol jsonl
+                                                 vds_common vds_config vds_log)
+  target_compile_options(controller_shortcut_test PRIVATE -UNDEBUG)
+  add_test(NAME controller_shortcut_test COMMAND controller_shortcut_test)
+
+  add_executable(host_session_test tests/host_session_test.cc
+                                   src/platform/linux/vds_host_watch.cc)
+  target_link_libraries(host_session_test PRIVATE vds_protocol)
+  target_compile_options(host_session_test PRIVATE -UNDEBUG)
+  add_test(NAME host_session_test COMMAND host_session_test)
 endif()

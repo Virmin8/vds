@@ -7,6 +7,7 @@
 
 const struct vds_controller_profile vds_dualsense_profile = {
 	.profile = VDS_PROFILE_DS5,
+	.vendor_id = VDS_SONY_VENDOR_ID,
 	.product_id = VDS_DS5_PRODUCT_ID,
 	.device_version = VDS_USB_DEVICE_BCD,
 	.device_class = VDS_USB_DEVICE_CLASS,

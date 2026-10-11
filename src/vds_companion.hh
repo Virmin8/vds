@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Companion protocol emulation for DS5 Bridge companion app clients.
+// Report layout mirrors ds5-bridge/companion/src/shared/protocol.ts.
+#pragma once
+
+#include <array>
+#include <chrono>
+#include <deque>
+#include <optional>
+#include <cstdint>
+#include <span>
+#include <string>
+
+#include "jsonl.hh"
+#include "vdsd_common.hh"
+
+namespace vds {
+
+class Logger;
+
+inline constexpr std::size_t kCompanionReportLength = 64;
+inline constexpr std::uint8_t kCompanionProtocolMajor = 1;
+inline constexpr std::uint8_t kCompanionProtocolMinor = 16;
+
+struct CompanionSettings {
+  std::uint16_t haptics_gain_percent = 100;
+  std::uint16_t classic_rumble_gain_percent = 100;
+  bool classic_rumble_v1 = false;
+  // DualSense audio buffer length written into every 0x36 packet header.
+  std::uint8_t haptics_buffer_length = 64;
+  // vdsd picks the buffer length from measured Bluetooth send gaps.
+  bool haptics_buffer_auto = false;
+  std::uint16_t trigger_effect_intensity_percent = 100;
+  bool player_led_enabled = true;
+  bool led_enabled = true;
+  bool idle_disconnect_enabled = false;
+  std::uint16_t idle_disconnect_timeout_minutes = 15; // 1-120, like the firmware
+  std::uint16_t speaker_volume_percent = 100;
+  std::uint8_t speaker_gain_level = 1;
+  std::uint8_t lightbar_red = 0;
+  std::uint8_t lightbar_green = 0;
+  std::uint8_t lightbar_blue = 255;
+  std::uint8_t lightbar_brightness_percent = 100;
+  bool lightbar_override_enabled = false;
+  bool mic_muted = false;
+  std::uint8_t mute_button_mode = 0;
+  std::uint8_t mute_keyboard_usage = 0;
+  std::uint8_t mute_keyboard_modifiers = 0;
+  bool quiet_mode_enabled = false;
+  bool usb_suspend_disconnect_enabled = false;
+  bool sleep_keybind_enabled = false;
+  bool speaker_volume_shortcut_enabled = false;
+  // Linux-port extension (command 0x42): Mute + D-pad left/right cycles the
+  // companion app's controller profiles.
+  bool profile_shortcut_enabled = false;
+  std::uint8_t host_persona_mode = 0;
+  // Linux-port extension (command 0x40): expose the touchpad as a desktop
+  // pointer. When false the daemon grabs the touchpad evdev node.
+  bool touchpad_pointer_enabled = true;
+};
+
+struct CompanionTriggerEffect {
+  bool active = false;
+  // V1 modes: 0 feedback, 1 weapon, 2 vibration.
+  // V2-only modes: 3 off, 4 multi-feedback, 5 slope, 6 multi-vibration.
+  std::uint8_t mode = 0;
+  std::uint8_t target = 0; // 0 both, 1 left, 2 right
+  std::uint8_t start_percent = 0;
+  std::uint8_t wall_percent = 0;
+  std::uint8_t force_percent = 0;
+  // V2 extensions (defaults keep V1 aggregate initializers valid).
+  std::uint8_t frequency_hz = 0;                // vibration/multi-vibration
+  std::array<std::uint8_t, 10> zone_percents{}; // multi-* per-zone strengths
+  std::uint8_t end_percent = 0;                 // slope end position
+  std::uint8_t end_force_percent = 0;           // slope end strength
+};
+
+// Momentary and persistent effects requested through companion commands; the
+// platform daemon translates these into BT output state on connected ports.
+struct CompanionActuation {
+  std::uint64_t version = 0;
+  // Persistent effects are stored per trigger so L2 and R2 can carry
+  // independent effects (an apply with target 0 sets both slots).
+  CompanionTriggerEffect persistent_trigger_left;
+  CompanionTriggerEffect persistent_trigger_right;
+  CompanionTriggerEffect test_trigger;
+  std::chrono::steady_clock::time_point test_trigger_until{};
+  bool test_rumble_active = false;
+  std::uint8_t test_rumble_power = 0;
+  std::chrono::steady_clock::time_point test_rumble_until{};
+  // SLEEP_CONTROLLER ("Turn Off Controller"): vdsd drops the Bluetooth link,
+  // which powers the DualSense off, then clears this.
+  bool power_off_pending = false;
+};
+
+inline constexpr std::size_t kCompanionRemapButtonCount = 21;
+inline constexpr std::size_t kCompanionMaxChordBindings = 16;
+inline constexpr std::size_t kCompanionMaxPendingInputEvents = 8;
+
+struct CompanionChordBinding {
+  std::uint8_t event = 0;   // 0x20+ chord function slot event code
+  std::uint8_t starter = 0; // 1 ps, 2 lfn, 3 rfn, 4 mute
+  std::uint8_t button = 0;  // REMAP_BUTTON_IDS index
+};
+
+// Per-port state for chord detection and press-scoped suppression.
+struct CompanionInputState {
+  std::uint32_t prev_pressed = 0;
+  std::uint32_t consumed_mask = 0;
+  // Mute + button shortcuts (volume, profiles): per-shortcut press/repeat
+  // tracking; mute_consumed hides Mute from the host until it is released.
+  // The PS hold-back keeps a PS-starter chord from leaking a lone PS press.
+  bool mute_consumed = false;
+  std::array<bool, 8> shortcut_pressed{};
+  std::array<std::chrono::steady_clock::time_point, 8> shortcut_last_step{};
+  bool ps_gate_active = false;
+  bool ps_passing = false; // held past the hold-back: passes until released
+  std::chrono::steady_clock::time_point ps_gate_until{};
+  std::chrono::steady_clock::time_point ps_replay_until{};
+};
+
+struct CompanionRuntime {
+  std::chrono::steady_clock::time_point started_at =
+      std::chrono::steady_clock::now();
+  CompanionSettings settings;
+  CompanionActuation actuation;
+  std::array<std::uint8_t, kCompanionRemapButtonCount> button_remap{};
+  bool button_remap_active = false;
+  std::vector<CompanionChordBinding> chord_bindings;
+  std::deque<std::uint8_t> pending_input_events;
+  std::uint16_t settings_revision = 0;
+  std::uint8_t last_command_id = 0;
+  std::uint8_t last_command_sequence = 0;
+  std::uint8_t last_result_code = 0;
+  std::uint8_t last_detail_code = 0;
+};
+
+// Rewrites a virtual USB DualSense input report in place: applies the
+// companion button remap table and detects chord bindings (starter held +
+// button pressed), queueing their event codes for the app to poll via the
+// companion INPUT report.
+// Idle Disconnect activity (DS5 Bridge firmware rules): any button, a
+// trigger, or a stick outside the 120-140 centre band. Motion does not count,
+// so a controller lying on a desk is idle. `report` is the USB input report.
+bool controller_input_active(std::span<const std::uint8_t> report);
+
+void companion_translate_input(CompanionRuntime &runtime,
+                               CompanionInputState &state,
+                               std::span<std::uint8_t> report);
+
+// Clears expired momentary effects; returns true when state changed.
+bool expire_companion_actuation(CompanionRuntime &runtime,
+                                std::chrono::steady_clock::time_point now);
+
+// Earliest pending expiry, if any momentary effect is active.
+std::optional<std::chrono::steady_clock::time_point>
+next_companion_actuation_deadline(const CompanionRuntime &runtime);
+
+// Handles {"command":"companion","op":"get"|"set"|"write",...} control
+// requests. "get" takes "report_id" and replies {"OK":true,"report":[64]};
+// "set"/"write" take "report" (64 bytes) and reply {"OK":true}.
+std::string handle_companion_control_request(
+    std::span<const JsonlField> fields, CompanionRuntime &runtime,
+    const std::string &db_path,
+    std::span<const VdsdControlControllerStatus> controllers, Logger &logger);
+
+} // namespace vds

@@ -32,6 +32,9 @@ enum {
 enum vds_profile {
 	VDS_PROFILE_DS5 = 0,
 	VDS_PROFILE_DSE = 1,
+	/* Persona profiles: a DualSense presented as another controller. */
+	VDS_PROFILE_DS4 = 2,
+	VDS_PROFILE_X360 = 3,
 };
 
 enum vds_frame_type {

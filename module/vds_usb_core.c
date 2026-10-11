@@ -49,15 +49,23 @@ static const struct usb_qualifier_descriptor vds_qualifier_desc = {
 
 static bool vds_usb_valid_profile(u32 profile)
 {
-	return profile == VDS_PROFILE_DS5 || profile == VDS_PROFILE_DSE;
+	return profile == VDS_PROFILE_DS5 || profile == VDS_PROFILE_DSE ||
+	       profile == VDS_PROFILE_DS4 || profile == VDS_PROFILE_X360;
 }
 
 static const struct vds_controller_profile *
 vds_usb_controller_profile_for_profile(u32 profile)
 {
-	if (profile == VDS_PROFILE_DSE)
+	switch (profile) {
+	case VDS_PROFILE_DSE:
 		return &vds_dualsense_edge_profile;
-	return &vds_dualsense_profile;
+	case VDS_PROFILE_DS4:
+		return &vds_ds4_profile;
+	case VDS_PROFILE_X360:
+		return &vds_xbox360_profile;
+	default:
+		return &vds_dualsense_profile;
+	}
 }
 
 static void vds_usb_reset_state_locked(struct vds_usb_device *dev)
@@ -480,7 +488,7 @@ vds_usb_standard_control(struct vds_usb_device *dev, struct urb *urb,
 			device_desc.bDeviceSubClass = profile->device_subclass;
 			device_desc.bDeviceProtocol = profile->device_protocol;
 			device_desc.bMaxPacketSize0 = profile->max_packet_size0;
-			device_desc.idVendor = cpu_to_le16(VDS_SONY_VENDOR_ID);
+			device_desc.idVendor = cpu_to_le16(profile->vendor_id);
 			device_desc.idProduct = cpu_to_le16(profile->product_id);
 			device_desc.bcdDevice = cpu_to_le16(profile->device_version);
 			device_desc.iManufacturer = 1;
@@ -511,13 +519,15 @@ vds_usb_standard_control(struct vds_usb_device *dev, struct urb *urb,
 				return -EPIPE;
 			}
 		case USB_DT_REPORT:
-			if ((index & 0xff) != profile->hid_interface)
+			if ((index & 0xff) != profile->hid_interface ||
+			    !profile->hid_report_descriptor)
 				return -EPIPE;
 			return vds_usb_copy_to_urb(urb,
 				profile->hid_report_descriptor,
 				profile->hid_report_descriptor_size);
 		case USB_DT_HID:
-			if ((index & 0xff) != profile->hid_interface)
+			if ((index & 0xff) != profile->hid_interface ||
+			    !profile->hid_descriptor)
 				return -EPIPE;
 			return vds_usb_copy_to_urb(urb, profile->hid_descriptor,
 				profile->hid_descriptor_size);
