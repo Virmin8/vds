@@ -8,12 +8,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <set>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <iomanip>
@@ -181,12 +184,30 @@ enum class EventType : std::uint32_t {
   Udev = 7,
   Sleep = 8,
   HostWatch = 9,
+  ControlClient = 10,
 };
 
 struct EventSource {
   EventType type;
   std::size_t index;
 };
+
+// A companion/CLI connection on the control socket. Clients are non-blocking
+// and served from the main epoll loop: a client that connects and writes
+// later must not stall audio, haptics or controller input while it does.
+struct ControlClient {
+  std::uint32_t id = 0;
+  vds::UniqueFd fd;
+  std::string request;
+  std::string reply;
+  std::size_t reply_sent = 0;
+  bool replying = false;
+  Clock::time_point deadline;
+};
+
+constexpr auto kControlClientTimeout = std::chrono::seconds(1);
+constexpr std::size_t kMaxControlClients = 16;
+constexpr std::size_t kMaxControlRequest = 8192;
 
 class SocketPathGuard {
 public:
@@ -1132,6 +1153,67 @@ std::optional<std::int8_t> read_controller_rssi(const std::string &address) {
   return result;
 }
 
+// Reads controller RSSI on its own thread. hci_read_rssi waits for the
+// adapter's reply (~5 ms), and doing that per control request on the main
+// loop delayed audio chunks every time the companion polled.
+class RssiPoller {
+public:
+  RssiPoller() : thread_([this] { run(); }) {}
+  ~RssiPoller() {
+    {
+      std::lock_guard lock(mutex_);
+      stop_ = true;
+    }
+    wake_.notify_all();
+    thread_.join();
+  }
+  RssiPoller(const RssiPoller &) = delete;
+  RssiPoller &operator=(const RssiPoller &) = delete;
+
+  void set_addresses(std::vector<std::string> addresses) {
+    std::lock_guard lock(mutex_);
+    if (addresses != addresses_) {
+      addresses_ = std::move(addresses);
+      wake_.notify_all();
+    }
+  }
+
+  std::optional<std::int8_t> rssi(const std::string &address) const {
+    std::lock_guard lock(mutex_);
+    const auto found = values_.find(address);
+    if (found == values_.end()) {
+      return std::nullopt;
+    }
+    return found->second;
+  }
+
+private:
+  void run() {
+    std::unique_lock lock(mutex_);
+    while (!stop_) {
+      const std::vector<std::string> addresses = addresses_;
+      lock.unlock();
+      std::map<std::string, std::int8_t> values;
+      for (const auto &address : addresses) {
+        if (const auto value = read_controller_rssi(address)) {
+          values.emplace(address, *value);
+        }
+      }
+      lock.lock();
+      values_ = std::move(values);
+      wake_.wait_for(lock, std::chrono::seconds(1),
+                     [&] { return stop_ || addresses_ != addresses; });
+    }
+  }
+
+  mutable std::mutex mutex_;
+  std::condition_variable wake_;
+  std::vector<std::string> addresses_;
+  std::map<std::string, std::int8_t> values_;
+  bool stop_ = false;
+  std::thread thread_;
+};
+
 /*
  * Bluetooth mode. In "vds" mode bluetoothd runs with --noplugin=input and vdsd
  * listens on the HID L2CAP PSMs. In "normal" mode vdsd closes its listeners
@@ -1507,78 +1589,41 @@ void publish_companion_audio_status(std::span<const VirtualPort> ports,
   companion.audio_status = status;
 }
 
-void handle_control_client(int control_fd, std::span<VirtualPort> ports,
-                           std::span<ControllerRuntime> controllers,
-                           const std::string &db_path,
-                           std::uint32_t &trace_flags, bool &reload_requested,
-                           vds::CompanionRuntime &companion,
-                           BluetoothModeState &bt_mode, bool bt_listening,
-                           const std::string &log_path, vds::Logger &logger) {
-  vds::UniqueFd client_fd(
-      ::accept4(control_fd, nullptr, nullptr, SOCK_CLOEXEC));
-  if (!client_fd) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-      return;
-    }
-    throw std::runtime_error("accept control client failed: " +
-                             std::string(std::strerror(errno)));
-  }
-
+std::string build_control_reply(std::string request,
+                                std::span<VirtualPort> ports,
+                                std::span<ControllerRuntime> controllers,
+                                const std::string &db_path,
+                                std::uint32_t &trace_flags,
+                                bool &reload_requested,
+                                vds::CompanionRuntime &companion,
+                                BluetoothModeState &bt_mode, bool bt_listening,
+                                const std::string &log_path,
+                                RssiPoller &rssi_poller,
+                                vds::Logger &logger) {
   publish_companion_audio_status(ports, controllers, companion);
-
-  // Companion requests carry a 64-byte report as a JSON array, so a request
-  // line can exceed a single small read; accumulate until newline or EOF.
-  constexpr std::size_t kMaxControlRequest = 8192;
-  std::array<char, 512> buffer{};
-  std::string request;
-  while (request.find('\n') == std::string::npos &&
-         request.size() < kMaxControlRequest) {
-    ssize_t got = 0;
-    do {
-      got = ::read(client_fd.get(), buffer.data(), buffer.size());
-    } while (got < 0 && errno == EINTR);
-    if (got < 0) {
-      throw std::runtime_error("read control client failed: " +
-                               std::string(std::strerror(errno)));
+  std::vector<std::string> connected;
+  for (const auto &controller : controllers) {
+    if (controller.virtual_connected) {
+      connected.push_back(controller.config.address);
     }
-    if (got == 0) {
-      break;
-    }
-    request.append(buffer.data(), static_cast<std::size_t>(got));
   }
-  if (request.empty()) {
-    return;
-  }
+  rssi_poller.set_addresses(std::move(connected));
 
-  std::string reply;
   const std::string command = trim_command(std::move(request));
   std::vector<vds::JsonlField> fields;
   const std::optional<std::string> local_command =
       vds::parse_control_command_name(command, fields);
   if (local_command == "audio") {
-    reply = handle_audio_stats_request(ports, controllers);
-    try {
-      vds::write_full(client_fd.get(), reply);
-    } catch (const std::exception &error) {
-      logger.log(vds::LogScope::Control, vds::LogLevel::Error,
-                 std::string("reply failed: ") + error.what());
-    }
-    return;
+    return handle_audio_stats_request(ports, controllers);
   }
-  if (local_command == "bluetooth" || local_command == "log" ||
-      local_command == "version") {
-    reply = local_command == "bluetooth"
-                ? handle_bluetooth_mode_request(fields, bt_mode, bt_listening, logger)
-            : local_command == "log"
-                ? vds::handle_daemon_log_request(fields, log_path, trace_flags, logger)
-                : vds::format_control_version_reply(vds::kVersion);
-    try {
-      vds::write_full(client_fd.get(), reply);
-    } catch (const std::exception &error) {
-      logger.log(vds::LogScope::Control, vds::LogLevel::Error,
-                 std::string("reply failed: ") + error.what());
-    }
-    return;
+  if (local_command == "bluetooth") {
+    return handle_bluetooth_mode_request(fields, bt_mode, bt_listening, logger);
+  }
+  if (local_command == "log") {
+    return vds::handle_daemon_log_request(fields, log_path, trace_flags, logger);
+  }
+  if (local_command == "version") {
+    return vds::format_control_version_reply(vds::kVersion);
   }
   std::vector<vds::VdsdControlControllerStatus> controller_statuses;
   controller_statuses.reserve(controllers.size());
@@ -1594,7 +1639,7 @@ void handle_control_client(int control_fd, std::span<VirtualPort> ports,
     }
     std::optional<std::int8_t> rssi;
     if (controller.virtual_connected) {
-      rssi = read_controller_rssi(controller.config.address);
+      rssi = rssi_poller.rssi(controller.config.address);
     }
     controller_statuses.push_back(vds::VdsdControlControllerStatus{
         .address = controller.config.address,
@@ -1640,19 +1685,10 @@ void handle_control_client(int control_fd, std::span<VirtualPort> ports,
   const std::vector<vds::VdsdControlPortStatus> port_statuses =
       vds::build_vdsd_control_port_statuses(port_candidates, port_bindings);
 
-  reply = vds::handle_vdsd_control_command(
+  return vds::handle_vdsd_control_command(
       command, db_path, controller_statuses, port_statuses,
       [] { return vds::list_bluez_controller_targets(); }, trace_flags,
       reload_requested, companion, logger);
-
-  try {
-    vds::write_full(client_fd.get(), reply);
-  } catch (const std::exception &error) {
-    if (trace_flags != 0) {
-      logger.log(vds::LogScope::Control, vds::LogLevel::Error,
-                 std::string("reply failed: ") + error.what());
-    }
-  }
 }
 
 // Grabs every DualSense touchpad evdev node (EVIOCGRAB) so the compositor
@@ -1960,9 +1996,10 @@ EventSource decode_event(std::uint64_t data) {
   };
 }
 
-void add_epoll_fd(int epoll_fd, int fd, EventType type, std::size_t index) {
+void add_epoll_fd(int epoll_fd, int fd, EventType type, std::size_t index,
+                  std::uint32_t events = EPOLLIN) {
   epoll_event event{};
-  event.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+  event.events = events | EPOLLERR | EPOLLHUP;
   event.data.u64 = encode_event(type, index);
   if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
     throw std::runtime_error("epoll add failed: " +
@@ -1970,11 +2007,129 @@ void add_epoll_fd(int epoll_fd, int fd, EventType type, std::size_t index) {
   }
 }
 
+std::uint32_t control_client_events(const ControlClient &client) {
+  return client.replying ? EPOLLOUT : EPOLLIN;
+}
+
+void accept_control_client(int control_fd, int epoll_fd,
+                           std::vector<ControlClient> &clients,
+                           std::uint32_t &next_client_id, vds::Logger &logger) {
+  vds::UniqueFd client_fd(
+      ::accept4(control_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
+  if (!client_fd) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ||
+        errno == ECONNABORTED) {
+      return;
+    }
+    throw std::runtime_error("accept control client failed: " +
+                             std::string(std::strerror(errno)));
+  }
+  if (clients.size() >= kMaxControlClients) {
+    logger.log(vds::LogScope::Control, vds::LogLevel::Warn,
+               "too many pending control clients; dropping new connection");
+    return;
+  }
+  ControlClient client;
+  client.id = next_client_id++;
+  client.fd = std::move(client_fd);
+  client.deadline = Clock::now() + kControlClientTimeout;
+  add_epoll_fd(epoll_fd, client.fd.get(), EventType::ControlClient, client.id);
+  clients.push_back(std::move(client));
+}
+
+// Reads what is available. Returns true once the request is complete (a
+// newline, EOF or the size cap); a client with nothing to say is dropped by
+// clearing its fd.
+bool read_control_client(ControlClient &client) {
+  std::array<char, 512> buffer{};
+  while (client.request.find('\n') == std::string::npos &&
+         client.request.size() < kMaxControlRequest) {
+    const ssize_t got =
+        ::read(client.fd.get(), buffer.data(), buffer.size());
+    if (got < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return false;
+      }
+      client.fd.reset();
+      return false;
+    }
+    if (got == 0) {
+      if (client.request.empty()) {
+        client.fd.reset();
+        return false;
+      }
+      return true;
+    }
+    client.request.append(buffer.data(), static_cast<std::size_t>(got));
+  }
+  return true;
+}
+
+// Writes as much of the reply as the socket takes. Returns true when the
+// client is finished with (reply sent or the socket failed).
+bool write_control_client(ControlClient &client, std::uint32_t trace_flags,
+                          vds::Logger &logger) {
+  while (client.reply_sent < client.reply.size()) {
+    const ssize_t written =
+        ::write(client.fd.get(), client.reply.data() + client.reply_sent,
+                client.reply.size() - client.reply_sent);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return false;
+      }
+      if (trace_flags != 0) {
+        logger.log(vds::LogScope::Control, vds::LogLevel::Error,
+                   std::string("reply failed: ") + std::strerror(errno));
+      }
+      return true;
+    }
+    client.reply_sent += static_cast<std::size_t>(written);
+  }
+  return true;
+}
+
+void expire_control_clients(std::vector<ControlClient> &clients,
+                            vds::Logger &logger) {
+  const auto now = Clock::now();
+  std::erase_if(clients, [&](const ControlClient &client) {
+    if (client.fd && now < client.deadline) {
+      return false;
+    }
+    if (client.fd) {
+      logger.log(vds::LogScope::Control, vds::LogLevel::Warn,
+                 client.replying ? "control client stopped reading the reply"
+                                 : "control client sent no request in time");
+    }
+    return true;
+  });
+}
+
+int control_client_timeout_ms(std::span<const ControlClient> clients) {
+  int timeout_ms = -1;
+  const auto now = Clock::now();
+  for (const auto &client : clients) {
+    const auto until = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           client.deadline - now)
+                           .count();
+    // Round up so the wake-up lands after the deadline, not just before it.
+    const int ms = static_cast<int>(std::max<long long>(until + 1, 0));
+    timeout_ms = timeout_ms < 0 ? ms : std::min(timeout_ms, ms);
+  }
+  return timeout_ms;
+}
+
 vds::UniqueFd rebuild_epoll(int control_fd,
                             const std::optional<vds::BtL2capAcceptor> &bt_acceptor,
                             const vds::VdsDeviceMonitor &vds_monitor,
                             std::span<VirtualPort> ports,
                             std::span<ControllerRuntime> controllers,
+                            std::span<const ControlClient> control_clients,
                             int sleep_fd, int host_watch_fd) {
   vds::UniqueFd epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
   if (!epoll_fd) {
@@ -1983,6 +2138,10 @@ vds::UniqueFd rebuild_epoll(int control_fd,
   }
 
   add_epoll_fd(epoll_fd.get(), control_fd, EventType::Control, 0);
+  for (const auto &client : control_clients) {
+    add_epoll_fd(epoll_fd.get(), client.fd.get(), EventType::ControlClient,
+                 client.id, control_client_events(client));
+  }
   add_epoll_fd(epoll_fd.get(), vds_monitor.fd(), EventType::Udev, 0);
   if (sleep_fd >= 0) {
     add_epoll_fd(epoll_fd.get(), sleep_fd, EventType::Sleep, 0);
@@ -2097,6 +2256,9 @@ int main(int argc, char **argv) {
     bool epoll_dirty = true;
     vds::CompanionRuntime companion;
     std::uint64_t applied_companion_version = 0;
+    std::vector<ControlClient> control_clients;
+    RssiPoller rssi_poller;
+    std::uint32_t next_control_client_id = 0;
 
     while (g_stop_requested == 0) {
       if (g_log_reopen_requested != 0) {
@@ -2128,7 +2290,7 @@ int main(int argc, char **argv) {
 
       if (epoll_dirty || !epoll_fd) {
         epoll_fd = rebuild_epoll(control_fd.get(), bt_acceptor, vds_monitor,
-                                 ports, controllers,
+                                 ports, controllers, control_clients,
                                  sleep_watcher ? sleep_watcher->fd() : -1,
                                  host_watch_fd.get());
         epoll_dirty = false;
@@ -2138,8 +2300,13 @@ int main(int argc, char **argv) {
         refresh_host_watches(ports, controllers, host_watch_fd.get(), logger);
         next_host_watch_refresh = Clock::now() + std::chrono::seconds(2);
       }
+      expire_control_clients(control_clients, logger);
       std::array<epoll_event, 64> events{};
       int timeout_ms = next_wakeup_timeout_ms(ports, controllers);
+      if (const int client_ms = control_client_timeout_ms(control_clients);
+          client_ms >= 0) {
+        timeout_ms = timeout_ms < 0 ? client_ms : std::min(timeout_ms, client_ms);
+      }
       if (host_watch_fd) {
         timeout_ms = timeout_ms < 0 ? 2000 : std::min(timeout_ms, 2000);
       }
@@ -2211,14 +2378,52 @@ int main(int argc, char **argv) {
 
         if (source.type == EventType::Control) {
           if ((revents & EPOLLIN) != 0) {
-            handle_control_client(control_fd.get(), ports, controllers,
-                                  options.db_path, trace_flags,
-                                  reload_requested, companion, bt_mode,
-                                  bt_acceptor.has_value(), options.log_path,
+            accept_control_client(control_fd.get(), epoll_fd.get(),
+                                  control_clients, next_control_client_id,
                                   logger);
           }
           if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
             throw std::runtime_error("control socket epoll error");
+          }
+          continue;
+        }
+
+        if (source.type == EventType::ControlClient) {
+          const auto client = std::find_if(
+              control_clients.begin(), control_clients.end(),
+              [&](const ControlClient &candidate) {
+                return candidate.id == source.index && candidate.fd;
+              });
+          if (client == control_clients.end()) {
+            continue;
+          }
+          bool done = false;
+          if (!client->replying) {
+            if (read_control_client(*client)) {
+              client->reply = build_control_reply(
+                  std::move(client->request), ports, controllers,
+                  options.db_path, trace_flags, reload_requested, companion,
+                  bt_mode, bt_acceptor.has_value(), options.log_path,
+                  rssi_poller, logger);
+              client->replying = true;
+              client->deadline = Clock::now() + kControlClientTimeout;
+              done = write_control_client(*client, trace_flags, logger);
+              if (!done) {
+                epoll_event event{};
+                event.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+                event.data.u64 =
+                    encode_event(EventType::ControlClient, client->id);
+                ::epoll_ctl(epoll_fd.get(), EPOLL_CTL_MOD, client->fd.get(),
+                            &event);
+              }
+            } else {
+              done = !client->fd;
+            }
+          } else {
+            done = write_control_client(*client, trace_flags, logger);
+          }
+          if (done) {
+            control_clients.erase(client);
           }
           continue;
         }
