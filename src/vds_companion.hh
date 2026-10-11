@@ -47,6 +47,9 @@ struct CompanionSettings {
   // host. Off by default; the controller's mic stream degrades speaker audio.
   bool duplex_enabled = false;
   std::uint16_t mic_volume_percent = 100;
+  // Linux-port extension (command 0x43): light the Mute button while the mic
+  // is off. When false the light stays off.
+  bool mute_led_enabled = true;
   std::uint8_t mute_button_mode = 0;
   std::uint8_t mute_keyboard_usage = 0;
   std::uint8_t mute_keyboard_modifiers = 0;

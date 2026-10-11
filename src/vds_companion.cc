@@ -282,6 +282,12 @@ std::uint8_t apply_command(CompanionRuntime &runtime,
     }
     settings.speaker_volume_shortcut_enabled = value == 1;
     return kAckOk;
+  case 0x43: // SET_MUTE_LED_ENABLED (Linux-port extension)
+    if (value > 1) {
+      return kAckErrInvalidValue;
+    }
+    settings.mute_led_enabled = value == 1;
+    return kAckOk;
   case 0x42: // SET_PROFILE_SHORTCUT_ENABLED (Linux-port extension)
     if (value > 1) {
       return kAckErrInvalidValue;

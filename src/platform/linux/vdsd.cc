@@ -165,6 +165,7 @@ float g_speaker_boost_db = vds::kDefaultSpeakerBoostDb;
 bool g_mic_forced = false;
 bool g_mic_allowed = false;
 bool g_mic_muted = false;
+bool g_mute_led_enabled = true;
 std::uint16_t g_mic_volume_percent = 100;
 
 struct Options {
@@ -200,6 +201,12 @@ struct AudioStats {
   // Since the previous `audio` control request.
   Clock::time_point window_start{};
   std::uint64_t window_packets = 0;
+  std::uint64_t window_mic_packets = 0;
+  // Controller mic packets: forwarded, and arrived while the mic was closed
+  // (each burst of those re-sends the close report).
+  std::uint64_t mic_packets_total = 0;
+  std::uint64_t mic_while_closed_total = 0;
+  Clock::time_point last_mic_close_resend{};
   std::uint64_t window_late = 0;
   std::uint64_t window_refills = 0;
   std::int64_t window_max_gap_us = 0;
@@ -823,8 +830,10 @@ void sync_port_mic(VirtualPort &port, vds::BtL2capBackend *bt_backend,
                      " sent=" + (sent ? "yes" : "no"));
     }
   }
-  // Mute light on whenever the mic is not live (off or muted), like a PS5.
-  port.output_state.set_mic_mute_led(!(g_mic_allowed && !g_mic_muted));
+  // Mute light on whenever the mic is not live (off or muted), like a PS5,
+  // unless the companion turned the light off.
+  port.output_state.set_mic_mute_led(g_mute_led_enabled &&
+                                     !(g_mic_allowed && !g_mic_muted));
 }
 
 void handle_frame(const vds_frame_header &header,
@@ -1253,6 +1262,19 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
     ++port.trace_state.bt_mic_packet_count;
     if (!port.audio_in_stream_active) {
       ++port.trace_state.bt_mic_drop_count;
+      // The mic should be closed: tell the controller again so it stops
+      // using airtime on mic packets nobody reads.
+      AudioStats &stats = port.audio_stats;
+      ++stats.mic_while_closed_total;
+      if (read_time - stats.last_mic_close_resend >= std::chrono::seconds(1)) {
+        stats.last_mic_close_resend = read_time;
+        const bool sent = bt_backend.try_send_output_report(
+            port.output_state.build_bt_mic_report(
+                false, std::max(stats.buffer_length, kMicBufferLength)));
+        logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
+                   port.path + " mic packets while closed, re-sent close sent=" +
+                       (sent ? "yes" : "no"));
+      }
       if (input_audio_trace &&
           (port.trace_state.bt_mic_drop_count == 1 ||
            port.trace_state.bt_mic_drop_count % 1000 == 0)) {
@@ -1275,6 +1297,8 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
       return true;
     }
 
+    ++port.audio_stats.mic_packets_total;
+    ++port.audio_stats.window_mic_packets;
     try {
       auto pcm = port.mic_decoder.decode(*opus_payload);
       port.trace_state.mic_peak_permille =
@@ -2053,15 +2077,15 @@ bool flush_pending_audio_chunk(VirtualPort &port,
   const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
   const auto &chunk = port.pending_audio_chunks.front();
   // Haptics gain is applied by the extractor before 8-bit quantization.
-  // While the mic records: enable the packets' mic section, keep 0x36 (the
-  // mic is not tested with 0x33), and keep the buffer at least at the mic's
-  // length. Otherwise packets match the pre-mic behavior.
+  // Four packet kinds, the smallest that carries what is live: 0x33 when the
+  // speaker is silent, 0x36 with speaker audio, each with the mic section
+  // enabled only while the mic records (buffer at least the mic's length).
   const bool mic_open = port.audio_in_stream_active;
   port.haptics_builder.set_buffer_length(
       mic_open ? std::max(port.audio_stats.buffer_length, kMicBufferLength)
                : port.audio_stats.buffer_length);
   const bool haptics_only =
-      !mic_open && !port.speaker_waveout_active &&
+      !port.speaker_waveout_active &&
       port.silent_speaker_packets >= kHapticsOnlyAfterSilentPackets &&
       !chunk.has_speaker_signal;
   const auto send_start = Clock::now();
@@ -2889,6 +2913,24 @@ std::string handle_audio_stats_request(std::span<const VirtualPort> ports,
     reply += std::string(",\"buffer_auto\":") + (stats.buffer_auto ? "true" : "false");
     reply += ",\"trims_total\":" + std::to_string(stats.trims_total);
     reply += std::string(",\"haptics_only\":") + (stats.haptics_only ? "true" : "false");
+    // haptics | haptics+speaker | haptics+mic | haptics+speaker+mic, or mic
+    // (capture with no output stream) / idle.
+    const bool mic_open = port.audio_in_stream_active;
+    std::string packet_mode =
+        streaming ? (stats.haptics_only ? "haptics" : "haptics+speaker")
+                  : (mic_open ? "mic" : "idle");
+    if (streaming && mic_open) {
+      packet_mode += "+mic";
+    }
+    reply += ',';
+    reply += vds::jsonl_string_field("packet_mode", packet_mode);
+    reply += ',';
+    reply += vds::jsonl_bool_field("mic_open", mic_open);
+    reply += ",\"mic_packets_per_second\":" +
+             fixed(window_s > 0.0 ? stats.window_mic_packets / window_s : 0.0, 1);
+    reply += ",\"mic_packets_total\":" + std::to_string(stats.mic_packets_total);
+    reply += ",\"mic_while_closed_total\":" +
+             std::to_string(stats.mic_while_closed_total);
     reply += ",\"haptics_only_total\":" + std::to_string(stats.haptics_only_total);
     reply += ",\"window_seconds\":" + fixed(window_s, 2);
     reply += ",\"packets_per_second\":" +
@@ -2916,6 +2958,7 @@ std::string handle_audio_stats_request(std::span<const VirtualPort> ports,
     reply += '}';
     stats.window_start = now;
     stats.window_packets = 0;
+    stats.window_mic_packets = 0;
     stats.window_late = 0;
     stats.window_refills = 0;
     stats.window_max_gap_us = 0;
@@ -3385,6 +3428,7 @@ void apply_companion_state(std::vector<VirtualPort> &ports,
   g_mic_allowed = g_mic_forced || settings.duplex_enabled;
   g_mic_muted = settings.mic_muted;
   g_mic_volume_percent = settings.mic_volume_percent;
+  g_mute_led_enabled = settings.mute_led_enabled;
   for (auto &port : ports) {
     ControllerRuntime *controller =
         controller_for_port(controllers, port.path);
