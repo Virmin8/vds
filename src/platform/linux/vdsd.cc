@@ -158,9 +158,11 @@ vds::HostPersona g_host_persona = vds::HostPersona::DualSense;
 // Built-in speaker loudness boost (--speaker-boost-db); bypassed while
 // headphones are plugged into the controller.
 float g_speaker_boost_db = vds::kDefaultSpeakerBoostDb;
-// Controller microphone forwarding (--no-mic turns it off): with it off the
-// controller's mic is never opened, so speaker/haptics packets stay mic-free.
-bool g_mic_enabled = true;
+// Controller microphone forwarding, off unless --mic. While the controller
+// streams its mic, speaker/haptics audio audibly degrades (clipping, and the
+// speaker gain stops having an effect), and hosts open the mic alongside
+// playback, so it stays closed by default.
+bool g_mic_enabled = false;
 
 struct Options {
   std::string socket = kDefaultControlSocket;
@@ -168,7 +170,7 @@ struct Options {
   std::string db_path;
   std::string bluetooth_override_script = vds::kDefaultBluetoothOverrideScript;
   float speaker_boost_db = vds::kDefaultSpeakerBoostDb;
-  bool mic_enabled = true;
+  bool mic_enabled = false;
 };
 
 struct LatencyTraceStats {
@@ -369,7 +371,7 @@ Options parse_platform_args(int argc, char **argv) {
   const std::string platform_options =
       std::string("[--socket ") + kDefaultControlSocket +
       "] [--bluetooth-override-script " +
-      vds::kDefaultBluetoothOverrideScript + "] [--speaker-boost-db 0-18] [--no-mic]";
+      vds::kDefaultBluetoothOverrideScript + "] [--speaker-boost-db 0-18] [--mic|--no-mic]";
   const auto next_value = [&](int &index, std::string_view option) {
     if (index + 1 >= argc) {
       throw std::runtime_error(std::string(option) + " requires a value");
@@ -400,6 +402,8 @@ Options parse_platform_args(int argc, char **argv) {
           options.speaker_boost_db > vds::kMaxSpeakerBoostDb) {
         throw std::runtime_error("--speaker-boost-db must be 0-18");
       }
+    } else if (arg == "--mic") {
+      options.mic_enabled = true;
     } else if (arg == "--no-mic") {
       options.mic_enabled = false;
     } else {
@@ -3483,10 +3487,9 @@ int main(int argc, char **argv) {
                    " db=" + options.db_path);
     g_speaker_boost_db = options.speaker_boost_db;
     g_mic_enabled = options.mic_enabled;
-    if (!g_mic_enabled) {
-      logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
-                 "controller microphone disabled (--no-mic)");
-    }
+    logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
+               g_mic_enabled ? "controller microphone enabled (--mic)"
+                             : "controller microphone off (enable with --mic)");
     logger.log(vds::LogScope::Output, vds::LogLevel::Info,
                "speaker boost " + std::to_string(g_speaker_boost_db) + " dB");
     if (vds::discover_vds_devices().empty()) {
