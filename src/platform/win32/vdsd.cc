@@ -1054,8 +1054,11 @@ private:
         continue;
       }
 
+      // Close the instance instead of DisconnectNamedPipe: disconnecting
+      // discards a reply the client has not read yet and fails its next
+      // read with ERROR_PIPE_NOT_CONNECTED (Node: "read EPIPE"). Closing
+      // leaves the reply readable, then the client reads end-of-file.
       handle_client(pipe.get());
-      DisconnectNamedPipe(pipe.get());
     }
   }
 
