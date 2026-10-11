@@ -37,6 +37,7 @@
 
 #include <timeapi.h>
 
+#include "audio_thread_priority.hh"
 #include "unique_handle.hh"
 #include "vds/ds5_usb.h"
 #include "vds_io.hh"
@@ -850,6 +851,8 @@ private:
 
     try {
       std::thread([port, client = std::move(client)]() mutable {
+        // Receives the host's isochronous speaker/haptics URBs.
+        const vds::win::AudioThreadPriorityGuard priority_guard;
         try {
           port->handle_import_session(client.get());
         } catch (const std::exception &error) {
@@ -1014,6 +1017,8 @@ void VirtualPort::Impl::iso_pacer_loop() {
   // clumps -- the same reason vdsd's audio flush loop uses its
   // HighResolutionSleeper. Scoped to this thread's lifetime.
   const bool high_res = timeBeginPeriod(1) == TIMERR_NOERROR;
+  // A late completion delays the host's next audio URB by the same amount.
+  const vds::win::AudioThreadPriorityGuard priority_guard;
   std::unique_lock<std::mutex> lk(pacer_mutex);
   while (!stop_requested.load()) {
     if (paced_replies.empty()) {

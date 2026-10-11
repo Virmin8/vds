@@ -4,7 +4,9 @@ endif()
 
 if(WIN32)
   set(VDS_VERSION_SCRIPT "${VDS_SOURCE_DIR}/generate_version.ps1")
-  find_program(VDS_VERSION_SCRIPT_SHELL pwsh powershell)
+  # NAMES: without it the second argument is a search path, not a fallback
+  # name, and machines without PowerShell 7 got version "unknown".
+  find_program(VDS_VERSION_SCRIPT_SHELL NAMES pwsh powershell)
   if(VDS_VERSION_SCRIPT_SHELL)
     set(VDS_VERSION_COMMAND
         "${VDS_VERSION_SCRIPT_SHELL}" -NoProfile -ExecutionPolicy Bypass -File

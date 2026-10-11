@@ -32,6 +32,7 @@
 #include <mmsystem.h>
 #include <sddl.h>
 
+#include "audio_thread_priority.hh"
 #include "jsonl.hh"
 #include "uapi/vds.h"
 #include "unique_handle.hh"
@@ -77,6 +78,7 @@ constexpr std::size_t kMaxControlRequest = 8192;
 constexpr std::size_t kAudioPrimeChunks = 4;
 std::atomic_bool g_stop_requested = false;
 HANDLE g_stop_event = nullptr;
+std::atomic<vds::Logger *> g_logger = nullptr;
 SERVICE_STATUS_HANDLE g_service_status_handle = nullptr;
 SERVICE_STATUS g_service_status{};
 DWORD g_service_exit_code = ERROR_SUCCESS;
@@ -85,6 +87,7 @@ using vds::trim_command;
 
 using vds::bt_feature_to_usb_feature_reply;
 using vds::hidp_output_packet;
+using vds::win::AudioThreadPriorityGuard;
 using vds::win::BluetoothTransport;
 using vds::win::describe_bluetooth_lookup;
 using vds::win::Frame;
@@ -123,69 +126,6 @@ public:
 private:
   UINT period_ms_ = 0;
   bool active_ = false;
-};
-
-class AudioThreadPriorityGuard {
-public:
-  AudioThreadPriorityGuard() {
-    previous_priority_ = GetThreadPriority(GetCurrentThread());
-    priority_set_ =
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-
-    avrt_ = LoadLibraryA("avrt.dll");
-    if (!avrt_) {
-      return;
-    }
-
-    av_revert_ = reinterpret_cast<AvRevertMmThreadCharacteristicsProc>(
-        GetProcAddress(avrt_, "AvRevertMmThreadCharacteristics"));
-    const auto av_set = reinterpret_cast<AvSetMmThreadCharacteristicsAProc>(
-        GetProcAddress(avrt_, "AvSetMmThreadCharacteristicsA"));
-    if (av_set == nullptr || av_revert_ == nullptr) {
-      return;
-    }
-
-    DWORD task_index = 0;
-    mmcss_handle_ = av_set("Pro Audio", &task_index);
-    if (mmcss_handle_ != nullptr) {
-      mmcss_active_ = true;
-    }
-  }
-
-  ~AudioThreadPriorityGuard() {
-    if (mmcss_active_ && av_revert_ != nullptr) {
-      av_revert_(mmcss_handle_);
-    }
-    if (priority_set_ && previous_priority_ != THREAD_PRIORITY_ERROR_RETURN) {
-      SetThreadPriority(GetCurrentThread(), previous_priority_);
-    }
-    if (avrt_ != nullptr) {
-      FreeLibrary(avrt_);
-    }
-  }
-
-  AudioThreadPriorityGuard(const AudioThreadPriorityGuard &) = delete;
-  AudioThreadPriorityGuard &
-  operator=(const AudioThreadPriorityGuard &) = delete;
-
-  bool boosted() const { return priority_set_ || mmcss_active_; }
-
-  std::string summary() const {
-    return "audio flush thread priority priority_set=" +
-           std::string(priority_set_ ? "yes" : "no") +
-           " mmcss=" + (mmcss_active_ ? "yes" : "no");
-  }
-
-private:
-  using AvSetMmThreadCharacteristicsAProc = HANDLE(WINAPI *)(LPCSTR, LPDWORD);
-  using AvRevertMmThreadCharacteristicsProc = BOOL(WINAPI *)(HANDLE);
-
-  HMODULE avrt_ = nullptr;
-  HANDLE mmcss_handle_ = nullptr;
-  AvRevertMmThreadCharacteristicsProc av_revert_ = nullptr;
-  int previous_priority_ = THREAD_PRIORITY_ERROR_RETURN;
-  bool priority_set_ = false;
-  bool mmcss_active_ = false;
 };
 
 Options parse_platform_args(int argc, char **argv) {
@@ -361,7 +301,8 @@ void update_service_status(DWORD state, DWORD win32_exit_code = ERROR_SUCCESS,
   g_service_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
   g_service_status.dwCurrentState = state;
   g_service_status.dwControlsAccepted =
-      state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+      state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN |
+                                     SERVICE_ACCEPT_POWEREVENT
                                : 0;
   g_service_status.dwWin32ExitCode = win32_exit_code;
   g_service_status.dwServiceSpecificExitCode =
@@ -372,7 +313,16 @@ void update_service_status(DWORD state, DWORD win32_exit_code = ERROR_SUCCESS,
   SetServiceStatus(g_service_status_handle, &g_service_status);
 }
 
-DWORD WINAPI service_control_handler(DWORD control, DWORD, LPVOID, LPVOID) {
+void power_off_for_sleep();
+
+DWORD WINAPI service_control_handler(DWORD control, DWORD event_type, LPVOID,
+                                     LPVOID) {
+  if (control == SERVICE_CONTROL_POWEREVENT) {
+    if (event_type == PBT_APMSUSPEND) {
+      power_off_for_sleep();
+    }
+    return NO_ERROR;
+  }
   if (control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN) {
     g_stop_requested = true;
     if (g_stop_event != nullptr) {
@@ -570,6 +520,8 @@ void virtual_to_bluetooth_loop(HANDLE virtual_device, BridgeSession &session,
                                WinBridgeUsb &usb, vds::Logger &logger,
                                const std::atomic_uint32_t *trace_flags,
                                std::atomic_bool &bridge_restart_requested) {
+  // Speaker/haptics audio from the host arrives on this thread.
+  const AudioThreadPriorityGuard priority_guard;
   while (!g_stop_requested.load() && !bridge_restart_requested.load()) {
     const Frame frame = vds::win::read_handle_frame(
         virtual_device, "virtual", handle_io_cancellation());
@@ -623,7 +575,7 @@ void audio_loop(BridgeSession &session, vds::Logger &logger,
   logger.log(vds::LogScope::Output,
              priority_guard.boosted() ? vds::LogLevel::Info
                                       : vds::LogLevel::Warn,
-             priority_guard.summary());
+             priority_guard.summary("audio flush"));
   UniqueHandle timer(CreateWaitableTimerExA(
       nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
       TIMER_MODIFY_STATE | SYNCHRONIZE));
@@ -816,6 +768,34 @@ void run_bridge_session(const std::string &device_address,
     std::lock_guard lock(g_bridge_mutex);
     std::erase(g_sessions, &session);
     vds::bridge_on_disconnect(session.port);
+  }
+}
+
+// PC Sleep Disconnect: Windows is about to sleep (PBT_APMSUSPEND, sent to the
+// service's control handler); turn the controllers off so they do not stay
+// on, draining the battery, and reconnect cleanly on wake.
+void power_off_for_sleep() {
+  vds::Logger *logger = g_logger.load();
+  if (logger == nullptr) {
+    return;
+  }
+  std::vector<std::string> addresses;
+  {
+    std::lock_guard lock(g_bridge_mutex);
+    if (!g_companion.settings.usb_suspend_disconnect_enabled) {
+      return;
+    }
+    for (const BridgeSession *session : g_sessions) {
+      addresses.push_back(session->address);
+    }
+  }
+  if (addresses.empty()) {
+    return;
+  }
+  logger->log(vds::LogScope::Power, vds::LogLevel::Info,
+              "system going to sleep; turning controller off");
+  for (const std::string &address : addresses) {
+    power_off_controller(address, "PC sleep", *logger);
   }
 }
 
@@ -1039,16 +1019,29 @@ private:
     return request->reply;
   }
 
+  UniqueHandle create_instance() {
+    UniqueHandle pipe(CreateNamedPipeA(
+        pipe_name_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES, 65536, 65536, 0, security_.attributes()));
+    if (!pipe) {
+      logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
+                  "failed to create control pipe " + pipe_name_ + ": " +
+                      win32_error_message(GetLastError()));
+    }
+    return pipe;
+  }
+
+  // Requests are served one at a time, but an instance is always listening:
+  // the next one is created as soon as a client connects. With a single
+  // instance, clients arriving together (the app polls status, audio and
+  // companion state at once) found no instance between two connections
+  // and failed with ERROR_FILE_NOT_FOUND (Node: "connect ENOENT").
   void thread_main() {
+    UniqueHandle next;
     while (!stop_requested_) {
-      UniqueHandle pipe(CreateNamedPipeA(
-          pipe_name_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-          PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 65536,
-          65536, 0, security_.attributes()));
+      UniqueHandle pipe = next ? std::move(next) : create_instance();
       if (!pipe) {
-        logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
-                    "failed to create control pipe " + pipe_name_ + ": " +
-                        win32_error_message(GetLastError()));
         WaitForSingleObject(stop_event_.get(), 1000);
         continue;
       }
@@ -1057,6 +1050,7 @@ private:
         DisconnectNamedPipe(pipe.get());
         continue;
       }
+      next = create_instance();
 
       // Close the instance instead of DisconnectNamedPipe: disconnecting
       // discards a reply the client has not read yet and fails its next
@@ -1293,7 +1287,8 @@ std::string handle_supervisor_control_command(
         .path = connected ? vds::win::usbip::endpoint_for_port(worker->port)
                           : "",
         .battery_status =
-            connected ? session_battery_status(worker->address) : 0xff,
+            connected ? session_battery_status(worker->address)
+                      : std::uint8_t{0xff},
     });
   }
 
@@ -1796,6 +1791,13 @@ int run_windows_daemon(int argc, char **argv, bool service_mode) {
     }
 
     vds::Logger logger(options.log_path);
+    // The service control handler (PC sleep) logs through this logger.
+    struct LoggerRegistration {
+      explicit LoggerRegistration(vds::Logger &registered) {
+        g_logger = &registered;
+      }
+      ~LoggerRegistration() { g_logger = nullptr; }
+    } logger_registration(logger);
     {
       vds::BridgeSettings &bridge = vds::bridge_settings();
       bridge.speaker_boost_db = options.speaker_boost_db;
