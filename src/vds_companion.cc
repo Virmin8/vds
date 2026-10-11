@@ -15,6 +15,7 @@ namespace {
 constexpr std::uint8_t kReportIdStatus = 0x01;
 constexpr std::uint8_t kReportIdCommand = 0x02;
 constexpr std::uint8_t kReportIdAck = 0x03;
+constexpr std::uint8_t kReportIdAudioStatus = 0x08;
 
 constexpr std::uint8_t kAckOk = 0x00;
 constexpr std::uint8_t kAckErrBadMagic = 0x01;
@@ -162,6 +163,40 @@ CompanionReport build_status_report(
   return report;
 }
 
+// AUDIO_STATUS (0x08), DS5 Bridge layout: mic pass-through state, headset
+// route and mic packet counters.
+CompanionReport build_audio_status_report(const CompanionRuntime &runtime) {
+  const CompanionAudioStatus &status = runtime.audio_status;
+  CompanionReport report;
+  write_header(report, kReportIdAudioStatus);
+  std::uint8_t primary_flags = 0;
+  if (runtime.settings.duplex_enabled) {
+    primary_flags |= 0x10;
+  }
+  if (status.duplex_active) {
+    primary_flags |= 0x20;
+  }
+  if (status.controller_ready) {
+    primary_flags |= 0x40;
+  }
+  if (status.mic_streaming) {
+    primary_flags |= 0x80;
+  }
+  report[9] = primary_flags;
+  report[10] = static_cast<std::uint8_t>((status.headset_plugged ? 0x01 : 0) |
+                                         (status.headset_route ? 0x02 : 0));
+  write_u32(report, 25, status.mic_packets_received);
+  write_u32(report, 29, status.mic_packets_dropped);
+  write_u32(report, 33, status.mic_decode_success);
+  write_u32(report, 37, status.mic_decode_fail);
+  write_u32(report, 41, status.mic_write_success);
+  write_u32(report, 45, status.mic_write_short);
+  write_u16(report, 57, status.mic_last_decoded_samples);
+  write_u16(report, 59, status.mic_last_written_bytes);
+  write_u16(report, 61, status.mic_peak_permille);
+  return report;
+}
+
 CompanionReport build_ack_report(const CompanionRuntime &runtime) {
   CompanionReport report;
   write_header(report, kReportIdAck);
@@ -241,7 +276,7 @@ std::uint8_t apply_command(CompanionRuntime &runtime,
   case 0x0F: // SET_USB_SUSPEND_DISCONNECT_ENABLED
     settings.usb_suspend_disconnect_enabled = value != 0;
     return kAckOk;
-  case 0x1D: // SET_SPEAKER_VOLUME_SHORTCUT_ENABLED (Mute + D-pad up/down)
+  case 0x1D: // SET_SPEAKER_VOLUME_SHORTCUT_ENABLED (Touchpad + D-pad up/down)
     if (value > 1) {
       return kAckErrInvalidValue;
     }
@@ -256,7 +291,14 @@ std::uint8_t apply_command(CompanionRuntime &runtime,
   case 0x10: // SET_SLEEP_KEYBIND_ENABLED
     settings.sleep_keybind_enabled = value != 0;
     return kAckOk;
-  case 0x1A: // SET_MIC_VOLUME (accepted; mic input is unsupported over BT)
+  case 0x19: // SET_DUPLEX_ENABLED (mic pass-through)
+    settings.duplex_enabled = value != 0;
+    return kAckOk;
+  case 0x1A: // SET_MIC_VOLUME (percent, applied to the forwarded mic audio)
+    if (value > 100) {
+      return kAckErrInvalidValue;
+    }
+    settings.mic_volume_percent = value;
     return kAckOk;
   case 0x1B: // SET_MIC_MUTE
     settings.mic_muted = value != 0;
@@ -343,7 +385,6 @@ std::uint8_t apply_command(CompanionRuntime &runtime,
     return kAckOk;
   // Settings accepted and stored by the app but not yet actuated here.
   case 0x12: // SET_POLLING_RATE_MODE
-  case 0x19: // SET_DUPLEX_ENABLED
   case 0x22: // SET_AUDIO_REACTIVE_HAPTICS
     return kAckOk;
   case 0x04:   // TEST_HAPTICS
@@ -611,6 +652,8 @@ constexpr std::uint8_t kIndexPs = 20;
 constexpr std::size_t kAnalogL2Offset = 5;
 constexpr std::size_t kAnalogR2Offset = 6;
 constexpr std::uint8_t kMuteButtonMask = 0x04; // report[10]
+// Shortcut modifier: touchpad click (report[10]), so Mute stays the mic mute.
+constexpr std::uint8_t kShortcutModifierMask = 0x02;
 
 // Hat value -> up/right/down/left bits, 8 = neutral.
 constexpr std::uint8_t kHatToDirections[9] = {0x1, 0x3, 0x2, 0x6, 0x4,
@@ -685,22 +728,22 @@ constexpr std::uint8_t kEventVolumeUp = 0x02;
 constexpr std::uint8_t kEventTurnOff = 0x03; // SLEEP_CONTROLLER event
 constexpr std::uint8_t kEventProfilePrevious = 0x06;
 constexpr std::uint8_t kEventProfileNext = 0x07;
-// Volume repeats while held (firmware timing). Shortcuts use Mute as the
-// modifier: holding PS for several seconds powers the DualSense off, so PS
-// combos with repeat are unusable. PS is only held back briefly for
+// Volume repeats while held (firmware timing). Shortcuts use a touchpad click
+// as the modifier (Mute is the mic mute; holding PS for several seconds powers
+// the DualSense off, so PS combos with repeat are unusable). PS is only held back briefly for
 // PS-starter chords, and replayed if no combo followed.
 constexpr auto kShortcutRepeat = std::chrono::milliseconds(180);
 constexpr auto kPsGateHold = std::chrono::milliseconds(250);
 constexpr auto kPsGateReplay = std::chrono::milliseconds(80);
 
-struct MuteShortcut {
+struct ModifierShortcut {
   std::uint8_t button;
   std::uint8_t event;
   bool repeat;
   bool CompanionSettings::*enabled;
 };
 
-constexpr std::array<MuteShortcut, 5> kMuteShortcuts = {{
+constexpr std::array<ModifierShortcut, 5> kModifierShortcuts = {{
     {kIndexTriangle, kEventTurnOff, false,
      &CompanionSettings::sleep_keybind_enabled},
     {kIndexDpadDown, kEventVolumeDown, true,
@@ -713,7 +756,7 @@ constexpr std::array<MuteShortcut, 5> kMuteShortcuts = {{
      &CompanionSettings::profile_shortcut_enabled},
 }};
 
-bool mute_shortcuts_enabled(const CompanionRuntime &runtime) {
+bool modifier_shortcuts_enabled(const CompanionRuntime &runtime) {
   return runtime.settings.speaker_volume_shortcut_enabled ||
          runtime.settings.profile_shortcut_enabled ||
          runtime.settings.sleep_keybind_enabled;
@@ -733,20 +776,21 @@ void queue_input_event(CompanionRuntime &runtime, std::uint8_t event) {
   }
 }
 
-// Mute + button shortcuts handled by the bridge (volume, profiles). The
-// button is consumed until released; Mute stays hidden until released.
-void process_mute_shortcuts(CompanionRuntime &runtime,
+// Touchpad click + button shortcuts handled by the bridge (volume, profiles,
+// turn off). The button is consumed until released; the touchpad click stays
+// hidden until released.
+void process_modifier_shortcuts(CompanionRuntime &runtime,
                             CompanionInputState &state, std::uint32_t pressed,
-                            bool mute_held,
+                            bool modifier_held,
                             std::chrono::steady_clock::time_point now) {
-  for (std::size_t i = 0; i < kMuteShortcuts.size(); ++i) {
-    const MuteShortcut &shortcut = kMuteShortcuts[i];
+  for (std::size_t i = 0; i < kModifierShortcuts.size(); ++i) {
+    const ModifierShortcut &shortcut = kModifierShortcuts[i];
     const std::uint32_t button_bit = 1u << shortcut.button;
-    const bool held = runtime.settings.*shortcut.enabled && mute_held &&
+    const bool held = runtime.settings.*shortcut.enabled && modifier_held &&
                       (pressed & button_bit) != 0;
     if (held) {
       state.consumed_mask |= button_bit;
-      state.mute_consumed = true;
+      state.modifier_consumed = true;
       const bool emit =
           !state.shortcut_pressed[i] ||
           (shortcut.repeat &&
@@ -822,7 +866,7 @@ void companion_translate_input(CompanionRuntime &runtime,
                                std::span<std::uint8_t> report) {
   if (report.size() < 11 ||
       (!runtime.button_remap_active && runtime.chord_bindings.empty() &&
-       !mute_shortcuts_enabled(runtime) && !state.mute_consumed &&
+       !modifier_shortcuts_enabled(runtime) && !state.modifier_consumed &&
        !ps_gate_wanted(runtime) && !state.ps_gate_active &&
        state.ps_replay_until == std::chrono::steady_clock::time_point{})) {
     return;
@@ -835,11 +879,11 @@ void companion_translate_input(CompanionRuntime &runtime,
   const bool physical_ps = (pressed & (1u << kIndexPs)) != 0;
   state.consumed_mask &= pressed; // released buttons are usable again
 
-  const bool mute_held = (report[10] & kMuteButtonMask) != 0;
-  if (!mute_held) {
-    state.mute_consumed = false;
+  const bool modifier_held = (report[10] & kShortcutModifierMask) != 0;
+  if (!modifier_held) {
+    state.modifier_consumed = false;
   }
-  process_mute_shortcuts(runtime, state, pressed, mute_held, now);
+  process_modifier_shortcuts(runtime, state, pressed, modifier_held, now);
 
   for (const CompanionChordBinding &binding : runtime.chord_bindings) {
     const std::uint32_t button_bit = 1u << binding.button;
@@ -902,8 +946,8 @@ void companion_translate_input(CompanionRuntime &runtime,
   }
 
   write_pressed_buttons(report, pressed);
-  if (state.mute_consumed) {
-    report[10] &= static_cast<std::uint8_t>(~kMuteButtonMask);
+  if (state.modifier_consumed) {
+    report[10] &= static_cast<std::uint8_t>(~kShortcutModifierMask);
   }
 }
 
@@ -965,6 +1009,9 @@ std::string handle_companion_control_request(
     }
     if (report_id == kReportIdAck) {
       return format_report_reply(build_ack_report(runtime));
+    }
+    if (report_id == kReportIdAudioStatus) {
+      return format_report_reply(build_audio_status_report(runtime));
     }
     if (report_id == 0x04) { // INPUT: next queued shortcut/chord event
       CompanionReport report{};

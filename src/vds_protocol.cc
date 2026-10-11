@@ -1108,6 +1108,9 @@ void DsOutputState::recompute_effective_state() {
     }
   }
 
+  effective_state_[kOutputFlag1Offset] |= kOutputFlag1MicMuteLedControlEnable;
+  effective_state_[kOutputMuteLedOffset] = mic_mute_led_ ? 1 : 0;
+
   if (!companion_.player_led_enabled) {
     set_state_bit(effective_state_[1], 4, true); // allow_player_indicators
     effective_state_[kOutputLedColorOffset - 1] = 0;
@@ -1215,6 +1218,24 @@ void DsOutputState::apply_mic_select() {
   state_[kOutputFlag0Offset] |= kOutputFlag0AudioControlEnable;
   state_[kOutputAudioControlOffset] =
       audio_control_with_output_path(audio_control_, audio_output_path_);
+}
+
+std::uint16_t scale_mic_pcm(std::span<std::uint8_t> pcm,
+                            std::uint16_t volume_percent, bool muted) {
+  const float level = std::clamp<float>(volume_percent / 100.0f, 0.0f, 1.0f);
+  const float gain = muted ? 0.0f : level * level * level;
+  int peak = 0;
+  for (std::size_t i = 0; i + 1 < pcm.size(); i += 2) {
+    const auto sample = static_cast<std::int16_t>(
+        static_cast<std::uint16_t>(pcm[i] | (pcm[i + 1] << 8)));
+    const auto scaled = static_cast<std::int16_t>(
+        std::clamp(std::lround(sample * gain), -32768L, 32767L));
+    peak = std::max(peak, std::abs(static_cast<int>(scaled)));
+    const auto bits = static_cast<std::uint16_t>(scaled);
+    pcm[i] = static_cast<std::uint8_t>(bits & 0xff);
+    pcm[i + 1] = static_cast<std::uint8_t>(bits >> 8);
+  }
+  return static_cast<std::uint16_t>(peak * 1000 / 32768);
 }
 
 BtInitReport DsOutputState::build_bt_init_report() {
@@ -1392,6 +1413,11 @@ void DsOutputState::set_audio_out_stream_active(bool active,
   recompute_effective_state();
 }
 
+void DsOutputState::set_mic_mute_led(bool on) {
+  mic_mute_led_ = on;
+  recompute_effective_state();
+}
+
 void DsOutputState::set_headset_mic_plugged(bool plugged) {
   headset_mic_plugged_ = plugged;
   state_[kOutputFlag0Offset] |=
@@ -1421,6 +1447,7 @@ BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
   state_[kOutputMicVolumeOffset] = active && !muted ? mic_volume_ : 0;
   state_[kOutputAudioControlOffset] = audio_control;
   state_[kOutputAudioControl2Offset] = audio_control2_;
+  mic_mute_led_ = muted;
   state_[kOutputMuteLedOffset] = muted ? 1 : 0;
   state_[kOutputPowerSaveControlOffset] = power_save_control;
   mic_stream_active_ = active;

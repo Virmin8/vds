@@ -158,11 +158,14 @@ vds::HostPersona g_host_persona = vds::HostPersona::DualSense;
 // Built-in speaker loudness boost (--speaker-boost-db); bypassed while
 // headphones are plugged into the controller.
 float g_speaker_boost_db = vds::kDefaultSpeakerBoostDb;
-// Controller microphone forwarding, off unless --mic. While the controller
-// streams its mic, speaker/haptics audio audibly degrades (clipping, and the
-// speaker gain stops having an effect), and hosts open the mic alongside
-// playback, so it stays closed by default.
-bool g_mic_enabled = false;
+// Controller microphone forwarding: off unless the companion app enables mic
+// pass-through (or vdsd runs with --mic). While the controller streams its
+// mic, speaker/haptics audio audibly degrades (clipping, and the speaker gain
+// stops having an effect), so it stays closed by default.
+bool g_mic_forced = false;
+bool g_mic_allowed = false;
+bool g_mic_muted = false;
+std::uint16_t g_mic_volume_percent = 100;
 
 struct Options {
   std::string socket = kDefaultControlSocket;
@@ -219,6 +222,9 @@ struct TraceState {
   std::uint64_t bt_mic_drop_count = 0;
   std::uint64_t bt_mic_decode_fail_count = 0;
   std::uint64_t audio_in_forward_count = 0;
+  std::uint64_t audio_in_write_short_count = 0;
+  std::uint16_t mic_last_decoded_bytes = 0;
+  std::uint16_t mic_peak_permille = 0;
   LatencyTraceStats output_hid_latency;
   LatencyTraceStats output_feature_latency;
   LatencyTraceStats output_audio_latency;
@@ -263,6 +269,8 @@ struct VirtualPort {
   vds::HostPersona persona = vds::HostPersona::DualSense;
   vds::PersonaState persona_state;
   bool audio_out_stream_active = false;
+  // Host capture stream open (audio-in altsetting) vs. controller mic open.
+  bool audio_in_requested = false;
   bool audio_in_stream_active = false;
   bool mic_muted = false;
   bool mute_button_down = false;
@@ -747,6 +755,7 @@ void reset_virtual_port(VirtualPort &port) {
   port.pending_bt_state_report.reset();
   port.next_haptics_send_time = {};
   port.audio_out_stream_active = false;
+  port.audio_in_requested = false;
   port.audio_in_stream_active = false;
   port.mic_muted = false;
   port.mute_button_down = false;
@@ -772,6 +781,7 @@ void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
   port.audio_primed = false;
   port.next_haptics_send_time = {};
   port.audio_out_stream_active = false;
+  port.audio_in_requested = false;
   port.audio_in_stream_active = false;
   port.mic_muted = false;
   port.mute_button_down = false;
@@ -785,6 +795,35 @@ void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
     logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
                port.path + " disconnect failed: " + error.what());
   }
+}
+
+// Opens or closes the controller mic so it follows the host's capture stream
+// while the mic is allowed, and pushes mic mute (and the mute LED) to it.
+// Callers forward the 0x31 state afterwards for the LED when the mic is shut.
+void sync_port_mic(VirtualPort &port, vds::BtL2capBackend *bt_backend,
+                   vds::Logger &logger) {
+  const bool open = g_mic_allowed && port.audio_in_requested;
+  const bool open_changed = open != port.audio_in_stream_active;
+  const bool mute_changed = g_mic_muted != port.mic_muted;
+  port.mic_muted = g_mic_muted;
+  port.audio_in_stream_active = open;
+  if (open_changed) {
+    port.mic_decoder = vds::MicAudioDecoder{};
+  }
+  if (bt_backend && (open_changed || (open && mute_changed))) {
+    bt_backend->try_send_output_report(
+        port.output_state.build_bt_mic_state_report(open, port.mic_muted));
+    if (open_changed) {
+      const bool sent = bt_backend->try_send_output_report(
+          port.output_state.build_bt_mic_report(
+              open, std::max(port.audio_stats.buffer_length, kMicBufferLength)));
+      logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
+                 port.path + " controller mic " +
+                     std::string(open ? "opened" : "closed") +
+                     " sent=" + (sent ? "yes" : "no"));
+    }
+  }
+  port.output_state.set_mic_mute_led(g_mic_allowed && g_mic_muted);
 }
 
 void handle_frame(const vds_frame_header &header,
@@ -831,25 +870,8 @@ void handle_frame(const vds_frame_header &header,
                    : "audio out interface route off");
       }
     } else if (event.interface_type == VDS_USB_INTERFACE_AUDIO_IN) {
-      port.audio_in_stream_active = g_mic_enabled && event.altsetting != 0;
-      port.mic_decoder = vds::MicAudioDecoder{};
-      if (bt_backend && g_mic_enabled) {
-        const auto state_report = port.output_state.build_bt_mic_state_report(
-            port.audio_in_stream_active, port.mic_muted);
-        bt_backend->try_send_output_report(state_report);
-        const auto report =
-            port.output_state.build_bt_mic_report(
-                port.audio_in_stream_active,
-                std::max(port.audio_stats.buffer_length, kMicBufferLength));
-        const bool sent = bt_backend->try_send_output_report(report);
-        if (trace_enabled(trace_flags, kTraceInputAudio)) {
-          logger.log(
-              vds::LogScope::InputAudio, vds::LogLevel::Info,
-              port.path + " mic " +
-                  std::string(port.audio_in_stream_active ? "open" : "close") +
-                  " sent=" + (sent ? "yes" : "no"));
-        }
-      }
+      port.audio_in_requested = event.altsetting != 0;
+      sync_port_mic(port, bt_backend, logger);
     }
     return;
   }
@@ -1254,10 +1276,17 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
 
     try {
       auto pcm = port.mic_decoder.decode(*opus_payload);
+      port.trace_state.mic_peak_permille =
+          vds::scale_mic_pcm(pcm, g_mic_volume_percent, port.mic_muted);
+      port.trace_state.mic_last_decoded_bytes =
+          static_cast<std::uint16_t>(pcm.size());
       const auto frame = vds::frame_bytes(VDS_FRAME_USB_AUDIO_IN, pcm);
       const bool wrote =
           write_vds_frame(port, frame, input_audio_trace, logger);
       ++port.trace_state.audio_in_forward_count;
+      if (!wrote) {
+        ++port.trace_state.audio_in_write_short_count;
+      }
       if (input_audio_trace && (port.trace_state.audio_in_forward_count == 1 ||
                                 port.trace_state.audio_in_forward_count %
                                         kInputTraceSummaryInterval ==
@@ -1374,8 +1403,13 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
   bool headset_mic_changed = false;
   bool mic_mute_changed = false;
   bool output_state_changed = false;
-  if (mute_button_down && !port.mute_button_down) {
-    port.mic_muted = !port.mic_muted;
+  // Mute toggles mic mute ("Normal" Mute button mode) while the mic is on; the
+  // app sees the change through the status report.
+  if (mute_button_down && !port.mute_button_down && g_mic_allowed &&
+      companion.settings.mute_button_mode == 0) {
+    companion.settings.mic_muted = !companion.settings.mic_muted;
+    ++companion.settings_revision;
+    g_mic_muted = companion.settings.mic_muted;
     mic_mute_changed = true;
   }
   port.mute_button_down = mute_button_down;
@@ -1383,16 +1417,16 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
     port.headset_mic_plugged = headset_mic_plugged;
     headset_mic_changed = true;
   }
-  if (mic_mute_changed ||
-      (headset_mic_changed && port.audio_in_stream_active)) {
-    const auto report = port.output_state.build_bt_mic_state_report(
-        port.audio_in_stream_active, port.mic_muted);
-    bt_backend.try_send_output_report(report);
-    if (input_trace) {
-      logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
-                 port.path + " mic " +
-                     std::string(port.mic_muted ? "muted" : "unmuted"));
-    }
+  if (mic_mute_changed) {
+    sync_port_mic(port, &bt_backend, logger);
+    forward_bt_state_if_changed(port, bt_backend, trace_flags, logger,
+                                "mic mute");
+    logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
+               port.path + " mic " +
+                   std::string(port.mic_muted ? "muted" : "unmuted"));
+  } else if (headset_mic_changed && port.audio_in_stream_active) {
+    bt_backend.try_send_output_report(
+        port.output_state.build_bt_mic_state_report(true, port.mic_muted));
   }
   if (headset_plugged != port.headset_plugged) {
     port.headset_plugged = headset_plugged;
@@ -2891,6 +2925,50 @@ std::optional<std::string> parse_bluetooth_mode_command(
   return field->value.string_value;
 }
 
+// Mic and headset state of the first connected controller, for the companion
+// AUDIO_STATUS report.
+void publish_companion_audio_status(std::span<const VirtualPort> ports,
+                                    std::span<const ControllerRuntime> controllers,
+                                    vds::CompanionRuntime &companion) {
+  vds::CompanionAudioStatus status;
+  for (const auto &controller : controllers) {
+    if (!controller.backend || !controller.virtual_connected) {
+      continue;
+    }
+    const auto port = std::find_if(ports.begin(), ports.end(),
+                                   [&](const VirtualPort &candidate) {
+                                     return candidate.path == controller.device;
+                                   });
+    if (port == ports.end()) {
+      continue;
+    }
+    const TraceState &trace = port->trace_state;
+    const auto u32 = [](std::uint64_t value) {
+      return static_cast<std::uint32_t>(value);
+    };
+    status.controller_ready = true;
+    status.duplex_active = port->audio_in_stream_active;
+    status.mic_streaming = port->audio_in_requested;
+    status.headset_plugged = port->headset_plugged;
+    status.headset_route = port->headset_plugged &&
+                           (port->audio_out_stream_active ||
+                            port->speaker_waveout_active);
+    status.mic_packets_received = u32(trace.bt_mic_packet_count);
+    status.mic_packets_dropped = u32(trace.bt_mic_drop_count);
+    status.mic_decode_fail = u32(trace.bt_mic_decode_fail_count);
+    status.mic_decode_success = u32(trace.audio_in_forward_count);
+    status.mic_write_short = u32(trace.audio_in_write_short_count);
+    status.mic_write_success =
+        u32(trace.audio_in_forward_count - trace.audio_in_write_short_count);
+    status.mic_last_decoded_samples = static_cast<std::uint16_t>(
+        trace.mic_last_decoded_bytes / (2 * sizeof(std::int16_t)));
+    status.mic_last_written_bytes = trace.mic_last_decoded_bytes;
+    status.mic_peak_permille = trace.mic_peak_permille;
+    break;
+  }
+  companion.audio_status = status;
+}
+
 void handle_control_client(int control_fd, std::span<VirtualPort> ports,
                            std::span<ControllerRuntime> controllers,
                            const std::string &db_path,
@@ -2907,6 +2985,8 @@ void handle_control_client(int control_fd, std::span<VirtualPort> ports,
     throw std::runtime_error("accept control client failed: " +
                              std::string(std::strerror(errno)));
   }
+
+  publish_companion_audio_status(ports, controllers, companion);
 
   // Companion requests carry a 64-byte report as a JSON array, so a request
   // line can exceed a single small read; accumulate until newline or EOF.
@@ -3289,6 +3369,9 @@ void apply_companion_state(std::vector<VirtualPort> &ports,
 
   g_host_persona = vds::host_persona_from_value(settings.host_persona_mode)
                        .value_or(vds::HostPersona::DualSense);
+  g_mic_allowed = g_mic_forced || settings.duplex_enabled;
+  g_mic_muted = settings.mic_muted;
+  g_mic_volume_percent = settings.mic_volume_percent;
   for (auto &port : ports) {
     ControllerRuntime *controller =
         controller_for_port(controllers, port.path);
@@ -3383,6 +3466,7 @@ void apply_companion_state(std::vector<VirtualPort> &ports,
                                          : settings.haptics_buffer_length;
     port.haptics_builder.set_buffer_length(port.audio_stats.buffer_length);
     port.output_state.set_companion_overrides(overrides);
+    sync_port_mic(port, &*controller->backend, logger);
     try {
       forward_bt_state_if_changed(port, *controller->backend, trace_flags,
                                   logger, "companion update");
@@ -3486,10 +3570,12 @@ int main(int argc, char **argv) {
                "started socket=" + options.socket + " log=" + options.log_path +
                    " db=" + options.db_path);
     g_speaker_boost_db = options.speaker_boost_db;
-    g_mic_enabled = options.mic_enabled;
-    logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
-               g_mic_enabled ? "controller microphone enabled (--mic)"
-                             : "controller microphone off (enable with --mic)");
+    g_mic_forced = options.mic_enabled;
+    g_mic_allowed = g_mic_forced;
+    if (g_mic_forced) {
+      logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
+                 "controller microphone enabled (--mic)");
+    }
     logger.log(vds::LogScope::Output, vds::LogLevel::Info,
                "speaker boost " + std::to_string(g_speaker_boost_db) + " dB");
     if (vds::discover_vds_devices().empty()) {

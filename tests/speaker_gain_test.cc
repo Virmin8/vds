@@ -60,15 +60,31 @@ int main() {
   const auto scaled = builder.build_packet(haptics, speaker, state.state(), false, false);
   assert(scaled[13 + 5] == 0x64);
 
-  // The mic is forwarded now, so the mute light follows the host
-  // (hid-playstation) instead of being forced off.
+  // vdsd owns the mute light: the host (hid-playstation toggles it on every
+  // Mute press) cannot turn it on; it shows mic mute while the mic is on.
   std::array<std::uint8_t, 1 + VDS_SET_STATE_SIZE> mute_light{};
   mute_light[0] = VDS_USB_OUTPUT_REPORT_ID;
   mute_light[1 + 1] = 0x01; // allow_mute_light
   mute_light[1 + 8] = 0x01; // mute light on
   assert(state.apply_usb_output_report(mute_light));
   assert((state.state()[1] & 0x01) != 0);
-  assert(state.state()[8] == 0x01);
+  assert(state.state()[8] == 0);
+  state.set_mic_mute_led(true);
+  assert(state.state()[8] == 1);
+  state.set_mic_mute_led(false);
+  assert(state.state()[8] == 0);
+
+  // Mic level: 100% passes, lower levels scale on a cubic curve, mute is
+  // silence; the peak is reported in permille.
+  {
+    std::vector<std::uint8_t> pcm = {0x00, 0x40, 0x00, 0xc0}; // 16384, -16384
+    assert(vds::scale_mic_pcm(pcm, 100, false) == 500);
+    assert(pcm[1] == 0x40 && pcm[3] == 0xc0);
+    vds::scale_mic_pcm(pcm, 50, false); // x0.125 -> 2048, -2048
+    assert(pcm[0] == 0x00 && pcm[1] == 0x08 && pcm[2] == 0x00 && pcm[3] == 0xf8);
+    assert(vds::scale_mic_pcm(pcm, 100, true) == 0);
+    assert(pcm[0] == 0 && pcm[1] == 0 && pcm[2] == 0 && pcm[3] == 0);
+  }
 
   // Audio packets must never write power-save/mic-mute state.
   vds::DsState muted = state.state();

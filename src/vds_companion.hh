@@ -43,6 +43,10 @@ struct CompanionSettings {
   std::uint8_t lightbar_brightness_percent = 100;
   bool lightbar_override_enabled = false;
   bool mic_muted = false;
+  // Mic pass-through (SET_DUPLEX_ENABLED): forward the controller mic to the
+  // host. Off by default; the controller's mic stream degrades speaker audio.
+  bool duplex_enabled = false;
+  std::uint16_t mic_volume_percent = 100;
   std::uint8_t mute_button_mode = 0;
   std::uint8_t mute_keyboard_usage = 0;
   std::uint8_t mute_keyboard_modifiers = 0;
@@ -50,7 +54,7 @@ struct CompanionSettings {
   bool usb_suspend_disconnect_enabled = false;
   bool sleep_keybind_enabled = false;
   bool speaker_volume_shortcut_enabled = false;
-  // Linux-port extension (command 0x42): Mute + D-pad left/right cycles the
+  // Linux-port extension (command 0x42): Touchpad + D-pad left/right cycles the
   // companion app's controller profiles.
   bool profile_shortcut_enabled = false;
   std::uint8_t host_persona_mode = 0;
@@ -107,16 +111,35 @@ struct CompanionChordBinding {
 struct CompanionInputState {
   std::uint32_t prev_pressed = 0;
   std::uint32_t consumed_mask = 0;
-  // Mute + button shortcuts (volume, profiles): per-shortcut press/repeat
-  // tracking; mute_consumed hides Mute from the host until it is released.
+  // Touchpad click + button shortcuts (volume, profiles): per-shortcut press/repeat
+  // tracking; modifier_consumed hides the touchpad click (shortcut modifier) from the
+  // host until it is released.
   // The PS hold-back keeps a PS-starter chord from leaking a lone PS press.
-  bool mute_consumed = false;
+  bool modifier_consumed = false;
   std::array<bool, 8> shortcut_pressed{};
   std::array<std::chrono::steady_clock::time_point, 8> shortcut_last_step{};
   bool ps_gate_active = false;
   bool ps_passing = false; // held past the hold-back: passes until released
   std::chrono::steady_clock::time_point ps_gate_until{};
   std::chrono::steady_clock::time_point ps_replay_until{};
+};
+
+// Mic state vdsd publishes for the companion AUDIO_STATUS report.
+struct CompanionAudioStatus {
+  bool controller_ready = false;
+  bool duplex_active = false;  // controller mic open
+  bool mic_streaming = false;  // host capture stream open
+  bool headset_plugged = false;
+  bool headset_route = false;
+  std::uint32_t mic_packets_received = 0;
+  std::uint32_t mic_packets_dropped = 0;
+  std::uint32_t mic_decode_success = 0;
+  std::uint32_t mic_decode_fail = 0;
+  std::uint32_t mic_write_success = 0;
+  std::uint32_t mic_write_short = 0;
+  std::uint16_t mic_last_decoded_samples = 0;
+  std::uint16_t mic_last_written_bytes = 0;
+  std::uint16_t mic_peak_permille = 0;
 };
 
 struct CompanionRuntime {
@@ -128,6 +151,7 @@ struct CompanionRuntime {
   bool button_remap_active = false;
   std::vector<CompanionChordBinding> chord_bindings;
   std::deque<std::uint8_t> pending_input_events;
+  CompanionAudioStatus audio_status;
   std::uint16_t settings_revision = 0;
   std::uint8_t last_command_id = 0;
   std::uint8_t last_command_sequence = 0;

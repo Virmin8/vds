@@ -205,6 +205,12 @@ private:
   std::unique_ptr<Decoder> decoder_;
 };
 
+// Applies the companion mic level (percent, perceptual curve like the speaker
+// volume) to forwarded mic PCM in place; muted gives silence. `pcm` is
+// interleaved S16LE. Returns the peak after scaling, in permille of full scale.
+std::uint16_t scale_mic_pcm(std::span<std::uint8_t> pcm,
+                            std::uint16_t volume_percent, bool muted);
+
 class HapticsPacketBuilder {
 public:
   // Controller audio buffer length (packet header bytes 5-9); lower values
@@ -356,6 +362,10 @@ public:
   void set_audio_out_stream_active(bool active, bool headset_plugged = false);
   void set_companion_overrides(const DsCompanionOverrides &overrides);
   void set_headset_mic_plugged(bool plugged);
+  // The mute LED shows vdsd's mic mute while the mic is enabled and is kept
+  // off otherwise (hid-playstation toggles it on every Mute press, which is
+  // also the shortcut modifier).
+  void set_mic_mute_led(bool on);
   BtStateReport build_bt_mic_state_report(bool active, bool muted);
   BtInitReport build_bt_mic_report(bool active, std::uint8_t buffer_length = 64);
   BtInitReport build_bt_init_report();
@@ -398,6 +408,7 @@ private:
   bool audio_out_stream_active_ = false;
   bool audio_out_headset_ = false;
   bool mic_stream_active_ = false;
+  bool mic_mute_led_ = false;
   bool headset_mic_plugged_ = false;
   std::uint8_t report_sequence_ = 0;
   std::uint8_t mic_sequence_ = 0;
