@@ -178,6 +178,11 @@ struct BridgePort {
   std::optional<BtStateReport> pending_bt_state_report;
   BridgeClock::time_point next_haptics_send_time{};
   bool audio_primed = false;
+  // Chunks buffered before sending after the queue runs dry; the trimmer
+  // keeps the standing queue at this depth. Each chunk is one Bluetooth
+  // packet interval of latency. Windows raises it: USB/IP over loopback TCP
+  // delivers audio in larger bursts than the Linux module.
+  std::size_t audio_prime_chunks = AudioQueueTrimmer::kTargetMinDepth;
   AudioQueueTrimmer queue_trimmer;
   HapticsBufferTuner buffer_tuner;
   std::size_t silent_speaker_packets = 0;

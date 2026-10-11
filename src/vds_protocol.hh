@@ -245,7 +245,8 @@ private:
   std::uint8_t buffer_length_ = 64;
 };
 
-// Keeps the queue between USB audio and Bluetooth sends at one spare chunk.
+// Keeps the queue between USB audio and Bluetooth sends at its target depth
+// (by default one spare chunk; BridgePort::audio_prime_chunks).
 // Input and output run at the same rate, so a backlog left by a burst would
 // otherwise add its latency for the rest of the stream.
 class AudioQueueTrimmer {
@@ -259,7 +260,8 @@ public:
   // Call before each send with the queue depth, including the chunk about to
   // be sent. True when the queue never fell to the target over the window, so
   // one chunk should be dropped.
-  bool should_trim(std::size_t depth);
+  bool should_trim(std::size_t depth,
+                   std::size_t target_min_depth = kTargetMinDepth);
   // The queue ran dry and will re-prime.
   void reset();
 

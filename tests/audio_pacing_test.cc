@@ -34,6 +34,17 @@ void queue_trimmer() {
     assert(!trimmer.should_trim(3));
   }
   assert(trimmer.should_trim(3));
+
+  // A deeper target (Windows primes 4 chunks) keeps that headroom.
+  trimmer.reset();
+  for (std::size_t i = 0; i + 1 < vds::AudioQueueTrimmer::kWindowPackets; ++i) {
+    assert(!trimmer.should_trim(4, 4));
+  }
+  assert(!trimmer.should_trim(4, 4));
+  for (std::size_t i = 0; i + 1 < vds::AudioQueueTrimmer::kWindowPackets; ++i) {
+    assert(!trimmer.should_trim(5, 4));
+  }
+  assert(trimmer.should_trim(5, 4));
 }
 
 void buffer_tuner() {

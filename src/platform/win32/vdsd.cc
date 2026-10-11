@@ -72,6 +72,9 @@ constexpr std::array<std::uint8_t, 3> kInitialFeatureReportIds = {0x09, 0x20,
                                                                   0x05};
 // Control requests carry a 64-byte companion report as a JSON array.
 constexpr std::size_t kMaxControlRequest = 8192;
+// Speaker/haptics chunks buffered before sending (~43 ms; Linux uses 2). With
+// 2, USB/IP's bursts ran the queue dry on ~10% of packets (audible crackle).
+constexpr std::size_t kAudioPrimeChunks = 4;
 std::atomic_bool g_stop_requested = false;
 HANDLE g_stop_event = nullptr;
 SERVICE_STATUS_HANDLE g_service_status_handle = nullptr;
@@ -717,6 +720,7 @@ void run_bridge_session(const std::string &device_address,
   WinBridgeUsb usb(virtual_device_handle.get());
   BridgeSession session;
   session.port.path = virtual_device;
+  session.port.audio_prime_chunks = kAudioPrimeChunks;
   session.address = vds::normalize_bluetooth_address(selected_config->address);
   session.bt = &bt;
   session.audio_wake = audio_wake.get();
@@ -1243,6 +1247,19 @@ bool worker_is_connected(const BridgeWorker &worker) {
   return !worker.done.load() && !worker.stop_requested.load();
 }
 
+// The battery byte the controller last reported (0xff until its first input
+// report), for the companion status and the tray.
+std::uint8_t session_battery_status(const std::string &address) {
+  const std::string normalized = vds::normalize_bluetooth_address(address);
+  std::lock_guard lock(g_bridge_mutex);
+  for (const BridgeSession *session : g_sessions) {
+    if (session->address == normalized) {
+      return session->port.battery_status;
+    }
+  }
+  return 0xff;
+}
+
 std::string handle_supervisor_control_command(
     const std::string &command,
     const std::vector<std::unique_ptr<BridgeWorker>> &workers,
@@ -1269,12 +1286,14 @@ std::string handle_supervisor_control_command(
   std::vector<vds::VdsdControlControllerStatus> controller_statuses;
   controller_statuses.reserve(workers.size());
   for (const auto &worker : workers) {
+    const bool connected = worker_is_connected(*worker);
     controller_statuses.push_back(vds::VdsdControlControllerStatus{
         .address = worker->address,
-        .connected = worker_is_connected(*worker),
-        .path = worker_is_connected(*worker)
-                    ? vds::win::usbip::endpoint_for_port(worker->port)
-                    : "",
+        .connected = connected,
+        .path = connected ? vds::win::usbip::endpoint_for_port(worker->port)
+                          : "",
+        .battery_status =
+            connected ? session_battery_status(worker->address) : 0xff,
     });
   }
 

@@ -37,15 +37,6 @@ constexpr auto kOutputTraceFeatureSlowWarn = std::chrono::milliseconds(20);
  * so a stalled stream does not replay a backlog.
  */
 constexpr auto kMaxAudioCatchup = 2 * kBridgeAudioOutputInterval;
-/*
- * Chunks to buffer after the queue runs dry before sending again (~21 ms).
- * Input and output run at the same rate, so this stays as latency on every
- * speaker sample and haptic for the rest of the stream; AudioQueueTrimmer keeps
- * it from growing past this. One chunk is not enough: USB delivers audio in
- * bursts that do not line up with the send times, and the queue keeps running
- * dry (tested: refills climbed continuously).
- */
-constexpr std::size_t kAudioPrimeChunks = 2;
 constexpr auto kHapticsOutputBlockedRetry = std::chrono::milliseconds(2);
 constexpr std::size_t kMaxPendingAudioChunks = 8;
 /*
@@ -1110,13 +1101,19 @@ BridgeInputResult bridge_handle_bt_input(BridgePort &port,
 }
 
 /*
- * After the queue runs dry, hold sending until kAudioPrimeChunks are buffered.
- * The WebHID waveout generator only queues one chunk at a time, so it is
- * exempt.
+ * After the queue runs dry, hold sending until port.audio_prime_chunks are
+ * buffered (2 on Linux, ~21 ms). Input and output run at the same rate, so
+ * this stays as latency on every speaker sample and haptic for the rest of the
+ * stream; AudioQueueTrimmer keeps it from growing past this. One chunk is not
+ * enough: USB delivers audio in bursts that do not line up with the send
+ * times, and the queue keeps running dry (tested: refills climbed
+ * continuously). The WebHID waveout generator only queues one chunk at a
+ * time, so it is exempt.
  */
 bool bridge_audio_chunk_ready(const BridgePort &port) {
-  const std::size_t needed =
-      port.audio_primed || port.speaker_waveout_active ? 1 : kAudioPrimeChunks;
+  const std::size_t needed = port.audio_primed || port.speaker_waveout_active
+                                 ? 1
+                                 : port.audio_prime_chunks;
   return port.pending_audio_chunks.size() >= needed;
 }
 
@@ -1178,7 +1175,8 @@ bool bridge_flush_audio(BridgePort &port, BridgeBluetooth &bt,
   if (!port.audio_primed) {
     port.queue_trimmer.reset();
   }
-  if (port.queue_trimmer.should_trim(port.pending_audio_chunks.size())) {
+  if (port.queue_trimmer.should_trim(port.pending_audio_chunks.size(),
+                                     port.audio_prime_chunks)) {
     // A standing backlog is pure haptics latency: skip one chunk to drain it.
     port.pending_audio_chunks.pop_front();
     ++port.audio_stats.trims_total;

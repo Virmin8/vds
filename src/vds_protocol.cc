@@ -1580,12 +1580,13 @@ DsState state_after_audio_packet(const std::optional<DsState> &previous,
   return result;
 }
 
-bool AudioQueueTrimmer::should_trim(std::size_t depth) {
+bool AudioQueueTrimmer::should_trim(std::size_t depth,
+                                    std::size_t target_min_depth) {
   window_min_depth_ = std::min(window_min_depth_, depth);
   if (++window_packets_ < kWindowPackets) {
     return false;
   }
-  const bool trim = window_min_depth_ > kTargetMinDepth;
+  const bool trim = window_min_depth_ > target_min_depth;
   reset();
   return trim;
 }
