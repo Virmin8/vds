@@ -1565,10 +1565,13 @@ void handle_control_client(int control_fd, std::span<VirtualPort> ports,
     }
     return;
   }
-  if (local_command == "bluetooth" || local_command == "log") {
+  if (local_command == "bluetooth" || local_command == "log" ||
+      local_command == "version") {
     reply = local_command == "bluetooth"
                 ? handle_bluetooth_mode_request(fields, bt_mode, bt_listening, logger)
-                : vds::handle_daemon_log_request(fields, log_path, trace_flags, logger);
+            : local_command == "log"
+                ? vds::handle_daemon_log_request(fields, log_path, trace_flags, logger)
+                : vds::format_control_version_reply(vds::kVersion);
     try {
       vds::write_full(client_fd.get(), reply);
     } catch (const std::exception &error) {

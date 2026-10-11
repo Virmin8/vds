@@ -142,5 +142,7 @@ std::string handle_daemon_log_request(std::span<const JsonlField> fields,
                                       const std::string &log_path,
                                       std::uint32_t &trace_flags,
                                       Logger &logger);
+// `version` control request: the daemon's build version.
+std::string format_control_version_reply(std::string_view version);
 
 } // namespace vds

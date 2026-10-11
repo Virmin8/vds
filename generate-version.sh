@@ -130,8 +130,9 @@ git_version() {
 		fi
 	done
 
+	# Without a version tag (a fork or shallow clone), the commit identifies the build.
 	if [ -z "$best_tag" ]; then
-		printf '%s\n' unknown
+		printf '%s%s\n' "$(git -C "$script_dir" rev-parse --short=7 HEAD)" "$dirty"
 		return
 	fi
 

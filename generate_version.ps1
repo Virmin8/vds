@@ -183,16 +183,13 @@ function Get-VdsGitVersionFromGit {
 
   try {
     $TagInfo = Get-VdsVersionTagInfoFromGit -RepoRoot $RepoRoot
-    if (!$TagInfo) {
-      return $null
-    }
 
     $DirtySuffix = ""
     if (Test-VdsWorkTreeDirty -RepoRoot $RepoRoot) {
       $DirtySuffix = "+"
     }
 
-    if ($TagInfo.Distance -eq 0) {
+    if ($TagInfo -and $TagInfo.Distance -eq 0) {
       return "$($TagInfo.Tag)$DirtySuffix"
     }
 
@@ -203,6 +200,11 @@ function Get-VdsGitVersionFromGit {
     )
     if ($ShaLines.Count -eq 0) {
       return $null
+    }
+
+    # Without a version tag (a fork or shallow clone), the commit identifies the build.
+    if (!$TagInfo) {
+      return "$($ShaLines[0])$DirtySuffix"
     }
 
     return "$($TagInfo.Tag)-$($TagInfo.Distance)-g$($ShaLines[0])$DirtySuffix"

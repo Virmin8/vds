@@ -1256,6 +1256,9 @@ std::string handle_supervisor_control_command(
     return vds::handle_daemon_log_request(fields, log_path, trace_flags,
                                           logger);
   }
+  if (local_command == "version") {
+    return vds::format_control_version_reply(vds::kVersion);
+  }
   if (local_command == "bluetooth") {
     return control_error_reply(
         "Bluetooth modes are not available on Windows");

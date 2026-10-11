@@ -470,6 +470,15 @@ std::string format_control_error_reply(std::string_view error) {
   return reply;
 }
 
+std::string format_control_version_reply(std::string_view version) {
+  std::string reply = "{";
+  reply += jsonl_bool_field("OK", true);
+  reply += ',';
+  reply += jsonl_string_field("version", version);
+  reply += "}\n";
+  return reply;
+}
+
 std::string format_control_attach_reply(bool ok, std::string_view error,
                                         const ControllerConfig &config) {
   std::string reply = "{";
