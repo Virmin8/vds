@@ -82,6 +82,9 @@ constexpr std::uint8_t kOutputMicSelectMask = 0x03;
 constexpr std::uint8_t kOutputMicSelectAuto = 0x00;
 constexpr std::uint8_t kOutputMicSelectInternal = 0x01;
 constexpr std::uint8_t kOutputMicAudioControl = 0x09;
+// Audio control byte: bit 2 echo cancel, bit 3 noise cancel.
+constexpr std::uint8_t kOutputMicEchoCancel = 0x04;
+constexpr std::uint8_t kOutputMicNoiseCancel = 0x08;
 constexpr std::uint8_t kOutputMicVolumeDefault = 0x08;
 constexpr std::uint8_t kOutputAudioControl2Default = 0x01;
 constexpr std::uint8_t kOutputAudioControlNonPathMask = 0xcf;
@@ -1184,15 +1187,18 @@ void DsOutputState::recompute_effective_state() {
     // sounded different with them set (pre-mic builds sent the path alone).
     effective_state_[kOutputAudioControlOffset] =
         mic_stream_active_
-            ? audio_control_with_output_path(
-                  effective_state_[kOutputAudioControlOffset],
-                  kOutputPathSpeaker)
+            ? audio_control_with_output_path(mic_audio_control(),
+                                             kOutputPathSpeaker)
             : kOutputPathSpeaker;
     effective_state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
+    const std::uint8_t gain_level =
+        mic_stream_active_ && companion_.mic_speaker_gain_level != 0
+            ? companion_.mic_speaker_gain_level
+            : companion_.speaker_gain_level;
     effective_state_[kOutputAudioControl2Offset] =
         static_cast<std::uint8_t>(
             (effective_state_[kOutputAudioControl2Offset] & 0xf8) |
-            std::clamp<std::uint8_t>(companion_.speaker_gain_level, 1, 7));
+            std::clamp<std::uint8_t>(gain_level, 1, 7));
   }
 }
 
@@ -1208,6 +1214,18 @@ void DsOutputState::restore_host_state(const HostState &snapshot) {
   // Re-applies the speaker routing bits for the stream as it is now, and
   // recomputes the effective state.
   set_audio_out_stream_active(audio_out_stream_active_, audio_out_headset_);
+}
+
+std::uint8_t DsOutputState::mic_audio_control() const {
+  std::uint8_t control = static_cast<std::uint8_t>(
+      audio_control_ & ~(kOutputMicEchoCancel | kOutputMicNoiseCancel));
+  if ((companion_.mic_processing & kMicProcessingNoiseCancel) != 0) {
+    control |= kOutputMicNoiseCancel;
+  }
+  if ((companion_.mic_processing & kMicProcessingEchoCancel) != 0) {
+    control |= kOutputMicEchoCancel;
+  }
+  return control;
 }
 
 void DsOutputState::apply_mic_select() {
@@ -1442,8 +1460,8 @@ BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
   state_[kOutputFlag1Offset] |= kOutputFlag1MicMuteLedControlEnable |
                                 kOutputFlag1PowerSaveControlEnable |
                                 kOutputFlag1AudioControl2Enable;
-  const std::uint8_t audio_control =
-      audio_control_with_output_path(audio_control_, audio_output_path_);
+  const std::uint8_t audio_control = audio_control_with_output_path(
+      active ? mic_audio_control() : audio_control_, audio_output_path_);
   state_[kOutputMicVolumeOffset] = active && !muted ? mic_volume_ : 0;
   state_[kOutputAudioControlOffset] = audio_control;
   state_[kOutputAudioControl2Offset] = audio_control2_;

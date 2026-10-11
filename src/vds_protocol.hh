@@ -31,6 +31,10 @@ constexpr std::size_t kMicUsbChannels = 2;
 constexpr std::size_t kMicPcmSize =
     kMicOpusFrames * kMicUsbChannels * sizeof(std::int16_t);
 
+// DsCompanionOverrides::mic_processing bits.
+constexpr std::uint8_t kMicProcessingNoiseCancel = 0x01;
+constexpr std::uint8_t kMicProcessingEchoCancel = 0x02;
+
 using BtReport = std::array<std::uint8_t, kBtHapticsReportSize>;
 // 0x33: the 0x36 layout without the speaker block, for when the speaker is
 // silent; about half the Bluetooth airtime per packet.
@@ -328,6 +332,11 @@ struct DsCompanionOverrides {
   std::uint8_t test_rumble_power = 0;
   std::uint16_t speaker_volume_percent = 100;
   std::uint8_t speaker_gain_level = 1;
+  // While the controller mic is open: its processing (bit 0 noise cancel,
+  // bit 1 echo cancel; the default is noise cancel) and the speaker preamp
+  // gain (0 keeps speaker_gain_level).
+  std::uint8_t mic_processing = kMicProcessingNoiseCancel;
+  std::uint8_t mic_speaker_gain_level = 0;
 };
 
 // Encodes a DS5 Bridge companion trigger effect (mode 0=feedback, 1=weapon,
@@ -408,6 +417,9 @@ private:
   bool audio_out_headset_ = false;
   bool mic_stream_active_ = false;
   bool mic_mute_led_ = false;
+  // Audio control byte while the mic is open: the host's mic select with the
+  // companion's processing bits.
+  std::uint8_t mic_audio_control() const;
   bool headset_mic_plugged_ = false;
   std::uint8_t report_sequence_ = 0;
   std::uint8_t mic_sequence_ = 0;

@@ -3537,6 +3537,8 @@ void apply_companion_state(std::vector<VirtualPort> &ports,
       settings.trigger_effect_intensity_percent;
   overrides.speaker_volume_percent = settings.speaker_volume_percent;
   overrides.speaker_gain_level = settings.speaker_gain_level;
+  overrides.mic_processing = settings.mic_processing;
+  overrides.mic_speaker_gain_level = settings.mic_speaker_gain_level;
   overrides.test_rumble_active = actuation.test_rumble_active;
   overrides.test_rumble_power = actuation.test_rumble_power;
 

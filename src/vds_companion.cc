@@ -288,6 +288,18 @@ std::uint8_t apply_command(CompanionRuntime &runtime,
     }
     settings.mute_led_enabled = value == 1;
     return kAckOk;
+  case 0x44: // SET_MIC_PROCESSING (Linux-port extension)
+    if (value > 3) {
+      return kAckErrInvalidValue;
+    }
+    settings.mic_processing = static_cast<std::uint8_t>(value);
+    return kAckOk;
+  case 0x45: // SET_MIC_SPEAKER_GAIN (Linux-port extension; 0 = speaker gain)
+    if (value > 7) {
+      return kAckErrInvalidValue;
+    }
+    settings.mic_speaker_gain_level = static_cast<std::uint8_t>(value);
+    return kAckOk;
   case 0x42: // SET_PROFILE_SHORTCUT_ENABLED (Linux-port extension)
     if (value > 1) {
       return kAckErrInvalidValue;

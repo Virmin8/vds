@@ -50,6 +50,11 @@ struct CompanionSettings {
   // Linux-port extension (command 0x43): light the Mute button while the mic
   // is off. When false the light stays off.
   bool mute_led_enabled = true;
+  // Linux-port extensions while the mic is open: processing (0x44; bit 0
+  // noise cancel, bit 1 echo cancel) and speaker gain (0x45; 0 = the speaker
+  // gain level).
+  std::uint8_t mic_processing = 1;
+  std::uint8_t mic_speaker_gain_level = 0;
   std::uint8_t mute_button_mode = 0;
   std::uint8_t mute_keyboard_usage = 0;
   std::uint8_t mute_keyboard_modifiers = 0;

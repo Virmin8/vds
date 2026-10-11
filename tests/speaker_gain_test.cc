@@ -74,6 +74,31 @@ int main() {
   state.set_mic_mute_led(false);
   assert(state.state()[8] == 0);
 
+  // While the mic is open: companion mic processing bits (default noise
+  // cancel) and the separate speaker gain; closing restores both.
+  {
+    vds::DsOutputState mic_state;
+    vds::DsCompanionOverrides mic_overrides;
+    mic_overrides.speaker_gain_level = 3;
+    mic_state.set_companion_overrides(mic_overrides);
+    mic_state.set_audio_out_stream_active(true);
+    const auto opened = mic_state.build_bt_mic_state_report(true, false);
+    assert((mic_state.state()[7] & 0x0c) == 0x08);
+    assert((mic_state.state()[37] & 0x07) == 3);
+    assert((opened[3 + 7] & 0x0c) == 0x08); // 0x31: state at byte 3
+    mic_overrides.mic_processing = vds::kMicProcessingEchoCancel;
+    mic_overrides.mic_speaker_gain_level = 5;
+    mic_state.set_companion_overrides(mic_overrides);
+    assert((mic_state.state()[7] & 0x0c) == 0x04);
+    assert((mic_state.state()[37] & 0x07) == 5);
+    mic_overrides.mic_processing = 0;
+    mic_state.set_companion_overrides(mic_overrides);
+    assert((mic_state.state()[7] & 0x0c) == 0);
+    (void)mic_state.build_bt_mic_state_report(false, true);
+    assert((mic_state.state()[7] & 0x3f) == 0x30);
+    assert((mic_state.state()[37] & 0x07) == 3);
+  }
+
   // Mic level: 100% passes, lower levels scale on a cubic curve, mute is
   // silence; the peak is reported in permille.
   {
