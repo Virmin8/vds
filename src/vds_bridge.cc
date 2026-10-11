@@ -401,6 +401,14 @@ void bridge_handle_feature_reply(BridgePort &port,
                         output_trace, logger);
 }
 
+void bridge_store_feature_report(BridgePort &port,
+                                 std::span<const std::uint8_t> report) {
+  if (!report.empty()) {
+    port.feature_cache[report[0]].assign(report.begin(), report.end());
+    port.feature_cached[report[0]] = true;
+  }
+}
+
 void bridge_cache_feature_report(BridgePort &port,
                                  std::span<const std::uint8_t> report,
                                  BridgeUsb &usb, bool trace, Logger &logger) {
@@ -1112,35 +1120,38 @@ bool bridge_audio_chunk_ready(const BridgePort &port) {
   return port.pending_audio_chunks.size() >= needed;
 }
 
-std::optional<int> bridge_wakeup_ms(const BridgePort &port,
-                                    Clock::time_point now) {
-  std::optional<int> wait;
-  const auto at_most = [&](int ms) {
-    wait = wait ? std::min(*wait, ms) : ms;
+std::optional<Clock::time_point>
+bridge_next_wakeup(const BridgePort &port, Clock::time_point now) {
+  std::optional<Clock::time_point> wake;
+  const auto at_most = [&](Clock::time_point when) {
+    wake = wake ? std::min(*wake, when) : when;
   };
   if (bridge_mic_retry_pending(port)) {
-    at_most(static_cast<int>(kBridgeMicOpenRetry.count()));
+    at_most(port.mic_open_resent_at + kBridgeMicOpenRetry);
+  }
+  if (port.pending_bt_state_report) {
+    at_most(now + std::chrono::milliseconds(kBridgePendingOutputPollMs));
   }
   const bool audio_due =
       bridge_audio_chunk_ready(port) || port.speaker_waveout_active;
-  if (!audio_due) {
-    if (port.pending_bt_state_report) {
-      at_most(kBridgePendingOutputPollMs);
-    }
-    return wait;
+  if (audio_due) {
+    const auto next_time = port.next_haptics_send_time;
+    at_most(next_time == Clock::time_point{} ? now : next_time);
   }
+  return wake;
+}
 
-  const auto next_time = port.next_haptics_send_time;
-  if (next_time == Clock::time_point{} || next_time <= now) {
+std::optional<int> bridge_wakeup_ms(const BridgePort &port,
+                                    Clock::time_point now) {
+  const auto wake = bridge_next_wakeup(port, now);
+  if (!wake) {
+    return std::nullopt;
+  }
+  if (*wake <= now) {
     return 0;
   }
-  const auto audio_wait =
-      std::chrono::ceil<std::chrono::milliseconds>(next_time - now);
-  at_most(static_cast<int>(audio_wait.count()));
-  if (port.pending_bt_state_report) {
-    at_most(kBridgePendingOutputPollMs);
-  }
-  return wait;
+  return static_cast<int>(
+      std::chrono::ceil<std::chrono::milliseconds>(*wake - now).count());
 }
 
 bool bridge_flush_audio(BridgePort &port, BridgeBluetooth &bt,

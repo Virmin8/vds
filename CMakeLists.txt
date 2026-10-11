@@ -226,6 +226,9 @@ target_link_libraries(audio_pacing_test PRIVATE vds_protocol)
 add_executable(bridge_test tests/bridge_test.cc)
 target_link_libraries(bridge_test PRIVATE vdsd_common vds_protocol jsonl
                                           vds_common vds_config vds_log)
+if(WIN32)
+  target_link_libraries(bridge_test PRIVATE vds_win32)
+endif()
 
 enable_testing()
 foreach(vds_test trigger_effect_v2_test speaker_gain_test bt_input_report_test

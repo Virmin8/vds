@@ -1242,16 +1242,6 @@ std::string format_bluetooth_mode_reply(const BluetoothModeState &state,
   return reply;
 }
 
-const vds::JsonlField *find_jsonl_field(std::span<const vds::JsonlField> fields,
-                                        std::string_view key) {
-  for (const auto &field : fields) {
-    if (field.key == key) {
-      return &field;
-    }
-  }
-  return nullptr;
-}
-
 std::string handle_bluetooth_mode_request(
     std::span<const vds::JsonlField> fields, BluetoothModeState &state,
     bool listening, vds::Logger &logger) {
@@ -1270,7 +1260,7 @@ std::string handle_bluetooth_mode_request(
     }
 
     bool settings_changed = false;
-    if (find_jsonl_field(fields, "auto") != nullptr) {
+    if (vds::find_jsonl_field(fields, "auto") != nullptr) {
       const std::string value =
           vds::require_jsonl_string(fields, "auto", context);
       if (value != "on" && value != "off") {
@@ -1280,7 +1270,7 @@ std::string handle_bluetooth_mode_request(
       state.idle_since = {};
       settings_changed = true;
     }
-    if (find_jsonl_field(fields, "idle_seconds") != nullptr) {
+    if (vds::find_jsonl_field(fields, "idle_seconds") != nullptr) {
       const std::string value =
           vds::require_jsonl_string(fields, "idle_seconds", context);
       if (value.empty() ||
@@ -1291,7 +1281,7 @@ std::string handle_bluetooth_mode_request(
       state.idle_timeout = clamp_bluetooth_idle_timeout(std::stoul(value));
       settings_changed = true;
     }
-    if (find_jsonl_field(fields, "mode") != nullptr) {
+    if (vds::find_jsonl_field(fields, "mode") != nullptr) {
       const std::string mode =
           vds::require_jsonl_string(fields, "mode", context);
       if (mode != "normal" && mode != "vds") {
@@ -1463,106 +1453,6 @@ bool bluetooth_mode_needs_poll(const BluetoothModeState &state,
 }
 
 /*
- * `log` control command: the daemon log is root-only, so the companion app reads
- * its tail through the socket (Diagnostics). Optional "trace": "on"|"off" with a
- * "scope" toggles tracing in the same request.
- */
-constexpr std::size_t kDaemonLogDefaultLines = 200;
-constexpr std::size_t kDaemonLogMaxLines = 1000;
-constexpr std::streamoff kDaemonLogTailBytes = 256 * 1024;
-
-std::vector<std::string> read_log_tail(const std::string &path,
-                                       std::size_t max_lines) {
-  std::vector<std::string> lines;
-  std::ifstream file(path, std::ios::binary | std::ios::ate);
-  if (!file) {
-    return lines;
-  }
-  const std::streamoff size = file.tellg();
-  const std::streamoff start = std::max<std::streamoff>(0, size - kDaemonLogTailBytes);
-  file.seekg(start);
-  std::string line;
-  bool first = start > 0; // first line is likely partial
-  while (std::getline(file, line)) {
-    if (first) {
-      first = false;
-      continue;
-    }
-    lines.push_back(std::move(line));
-  }
-  if (lines.size() > max_lines) {
-    lines.erase(lines.begin(),
-                lines.begin() + static_cast<std::ptrdiff_t>(lines.size() - max_lines));
-  }
-  return lines;
-}
-
-std::string handle_daemon_log_request(std::span<const vds::JsonlField> fields,
-                                      const std::string &log_path,
-                                      std::uint32_t &trace_flags,
-                                      vds::Logger &logger) {
-  constexpr std::string_view context = "log request";
-  std::string reply = "{";
-  try {
-    static constexpr std::string_view expected[] = {"command", "lines", "trace",
-                                                     "scope"};
-    vds::reject_unknown_jsonl_fields(fields, expected, context);
-    std::size_t max_lines = kDaemonLogDefaultLines;
-    if (find_jsonl_field(fields, "lines") != nullptr) {
-      const std::string value = vds::require_jsonl_string(fields, "lines", context);
-      if (value.empty() || value.size() > 5 ||
-          value.find_first_not_of("0123456789") != std::string::npos) {
-        throw std::runtime_error("log lines must be a number");
-      }
-      max_lines = std::clamp<std::size_t>(std::stoul(value), 1, kDaemonLogMaxLines);
-    }
-    if (find_jsonl_field(fields, "trace") != nullptr) {
-      const std::string mode = vds::require_jsonl_string(fields, "trace", context);
-      const std::uint32_t scope =
-          find_jsonl_field(fields, "scope") != nullptr
-              ? vds::parse_trace_scope(vds::require_jsonl_string(fields, "scope", context))
-              : vds::kTraceOutput;
-      if (mode == "on") {
-        trace_flags |= scope;
-      } else if (mode == "off") {
-        trace_flags &= ~scope;
-      } else {
-        throw std::runtime_error("log trace must be on or off");
-      }
-      logger.log(vds::LogScope::Control, vds::LogLevel::Info,
-                 "trace " + vds::trace_scope_name(scope) + " " + mode +
-                     " (companion diagnostics)");
-    }
-    reply += vds::jsonl_bool_field("OK", true);
-    reply += ',';
-    reply += vds::jsonl_string_field("error", "");
-    reply += ',';
-    reply += vds::jsonl_bool_field("trace_input",
-                                   vds::trace_enabled(trace_flags, vds::kTraceInput));
-    reply += ',';
-    reply += vds::jsonl_bool_field("trace_output",
-                                   vds::trace_enabled(trace_flags, vds::kTraceOutput));
-    reply += ",\"lines\":[";
-    const std::vector<std::string> lines = read_log_tail(log_path, max_lines);
-    for (std::size_t i = 0; i < lines.size(); ++i) {
-      if (i > 0) {
-        reply += ',';
-      }
-      reply += vds::jsonl_string_value(lines[i]);
-    }
-    reply += "]}\n";
-    return reply;
-  } catch (const std::exception &error) {
-    reply = "{";
-    reply += vds::jsonl_bool_field("OK", false);
-    reply += ',';
-    reply += vds::jsonl_string_field("error", error.what());
-    reply += "}\n";
-    return reply;
-  }
-}
-
-/*
  * `audio` control command: per-port audio delivery stats for the companion
  * Diagnostics view. Window counters cover the time since the previous
  * request and are reset by it.
@@ -1592,20 +1482,6 @@ std::string handle_audio_stats_request(std::span<VirtualPort> ports,
   }
   reply += "]}\n";
   return reply;
-}
-
-std::optional<std::string> parse_bluetooth_mode_command(
-    const std::string &command, std::vector<vds::JsonlField> &fields) {
-  try {
-    fields = vds::parse_jsonl_object(command, "control request");
-  } catch (const std::exception &) {
-    return std::nullopt;
-  }
-  const vds::JsonlField *field = find_jsonl_field(fields, "command");
-  if (field == nullptr || field->value.is_array) {
-    return std::nullopt;
-  }
-  return field->value.string_value;
 }
 
 // Mic and headset state of the first connected controller, for the companion
@@ -1678,7 +1554,7 @@ void handle_control_client(int control_fd, std::span<VirtualPort> ports,
   const std::string command = trim_command(std::move(request));
   std::vector<vds::JsonlField> fields;
   const std::optional<std::string> local_command =
-      parse_bluetooth_mode_command(command, fields);
+      vds::parse_control_command_name(command, fields);
   if (local_command == "audio") {
     reply = handle_audio_stats_request(ports, controllers);
     try {
@@ -1692,7 +1568,7 @@ void handle_control_client(int control_fd, std::span<VirtualPort> ports,
   if (local_command == "bluetooth" || local_command == "log") {
     reply = local_command == "bluetooth"
                 ? handle_bluetooth_mode_request(fields, bt_mode, bt_listening, logger)
-                : handle_daemon_log_request(fields, log_path, trace_flags, logger);
+                : vds::handle_daemon_log_request(fields, log_path, trace_flags, logger);
     try {
       vds::write_full(client_fd.get(), reply);
     } catch (const std::exception &error) {

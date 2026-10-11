@@ -6,11 +6,13 @@
 #include <cstdint>
 #include <functional>
 #include <iosfwd>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "jsonl.hh"
 #include "vds_config.hh"
 
 namespace vds {
@@ -127,5 +129,18 @@ std::string handle_vdsd_control_command(
     const std::function<std::vector<ControllerTarget>()> &list_targets,
     std::uint32_t &trace_flags, bool &reload_requested,
     CompanionRuntime &companion, Logger &logger);
+
+const JsonlField *find_jsonl_field(std::span<const JsonlField> fields,
+                                   std::string_view key);
+// The "command" of a daemon-local control request (audio, log, bluetooth);
+// nullopt when the request is not a JSON object with one.
+std::optional<std::string>
+parse_control_command_name(const std::string &command,
+                           std::vector<JsonlField> &fields);
+// `log` control request: the daemon log's tail, and trace on/off.
+std::string handle_daemon_log_request(std::span<const JsonlField> fields,
+                                      const std::string &log_path,
+                                      std::uint32_t &trace_flags,
+                                      Logger &logger);
 
 } // namespace vds

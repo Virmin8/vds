@@ -53,5 +53,9 @@ std::vector<HidBluetoothDevice> list_bluetooth_controller_devices();
 std::string describe_bluetooth_lookup(const std::string &address);
 std::unique_ptr<BluetoothTransport>
 make_hid_bluetooth_transport(const std::string &address);
+// Drops the controller's Bluetooth link (it powers itself off, like a
+// DualSense the host disconnects; PS turns it back on). False when no radio
+// knew the device.
+bool disconnect_bluetooth_device(const std::string &address);
 
 } // namespace vds::win

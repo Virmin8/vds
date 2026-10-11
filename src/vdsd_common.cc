@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -750,5 +751,132 @@ std::string handle_vdsd_control_command(
     return format_control_error_reply(error.what());
   }
 }
+
+const JsonlField *find_jsonl_field(std::span<const JsonlField> fields,
+                                        std::string_view key) {
+  for (const auto &field : fields) {
+    if (field.key == key) {
+      return &field;
+    }
+  }
+  return nullptr;
+}
+
+
+std::optional<std::string> parse_control_command_name(
+    const std::string &command, std::vector<JsonlField> &fields) {
+  try {
+    fields = parse_jsonl_object(command, "control request");
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+  const JsonlField *field = find_jsonl_field(fields, "command");
+  if (field == nullptr || field->value.is_array) {
+    return std::nullopt;
+  }
+  return field->value.string_value;
+}
+
+
+/*
+ * `log` control command: the daemon log is root-only, so the companion app reads
+ * its tail through the socket (Diagnostics). Optional "trace": "on"|"off" with a
+ * "scope" toggles tracing in the same request.
+ */
+constexpr std::size_t kDaemonLogDefaultLines = 200;
+constexpr std::size_t kDaemonLogMaxLines = 1000;
+constexpr std::streamoff kDaemonLogTailBytes = 256 * 1024;
+
+std::vector<std::string> read_log_tail(const std::string &path,
+                                       std::size_t max_lines) {
+  std::vector<std::string> lines;
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file) {
+    return lines;
+  }
+  const std::streamoff size = file.tellg();
+  const std::streamoff start = std::max<std::streamoff>(0, size - kDaemonLogTailBytes);
+  file.seekg(start);
+  std::string line;
+  bool first = start > 0; // first line is likely partial
+  while (std::getline(file, line)) {
+    if (first) {
+      first = false;
+      continue;
+    }
+    lines.push_back(std::move(line));
+  }
+  if (lines.size() > max_lines) {
+    lines.erase(lines.begin(),
+                lines.begin() + static_cast<std::ptrdiff_t>(lines.size() - max_lines));
+  }
+  return lines;
+}
+
+std::string handle_daemon_log_request(std::span<const JsonlField> fields,
+                                      const std::string &log_path,
+                                      std::uint32_t &trace_flags,
+                                      Logger &logger) {
+  constexpr std::string_view context = "log request";
+  std::string reply = "{";
+  try {
+    static constexpr std::string_view expected[] = {"command", "lines", "trace",
+                                                     "scope"};
+    reject_unknown_jsonl_fields(fields, expected, context);
+    std::size_t max_lines = kDaemonLogDefaultLines;
+    if (find_jsonl_field(fields, "lines") != nullptr) {
+      const std::string value = require_jsonl_string(fields, "lines", context);
+      if (value.empty() || value.size() > 5 ||
+          value.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::runtime_error("log lines must be a number");
+      }
+      max_lines = std::clamp<std::size_t>(std::stoul(value), 1, kDaemonLogMaxLines);
+    }
+    if (find_jsonl_field(fields, "trace") != nullptr) {
+      const std::string mode = require_jsonl_string(fields, "trace", context);
+      const std::uint32_t scope =
+          find_jsonl_field(fields, "scope") != nullptr
+              ? parse_trace_scope(require_jsonl_string(fields, "scope", context))
+              : kTraceOutput;
+      if (mode == "on") {
+        trace_flags |= scope;
+      } else if (mode == "off") {
+        trace_flags &= ~scope;
+      } else {
+        throw std::runtime_error("log trace must be on or off");
+      }
+      logger.log(LogScope::Control, LogLevel::Info,
+                 "trace " + trace_scope_name(scope) + " " + mode +
+                     " (companion diagnostics)");
+    }
+    reply += jsonl_bool_field("OK", true);
+    reply += ',';
+    reply += jsonl_string_field("error", "");
+    reply += ',';
+    reply += jsonl_bool_field("trace_input",
+                                   trace_enabled(trace_flags, kTraceInput));
+    reply += ',';
+    reply += jsonl_bool_field("trace_output",
+                                   trace_enabled(trace_flags, kTraceOutput));
+    reply += ",\"lines\":[";
+    const std::vector<std::string> lines = read_log_tail(log_path, max_lines);
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+      if (i > 0) {
+        reply += ',';
+      }
+      reply += jsonl_string_value(lines[i]);
+    }
+    reply += "]}\n";
+    return reply;
+  } catch (const std::exception &error) {
+    reply = "{";
+    reply += jsonl_bool_field("OK", false);
+    reply += ',';
+    reply += jsonl_string_field("error", error.what());
+    reply += "}\n";
+    return reply;
+  }
+}
+
 
 } // namespace vds

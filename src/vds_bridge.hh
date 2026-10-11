@@ -243,6 +243,9 @@ void bridge_handle_feature_reply(BridgePort &port,
                                  std::span<const std::uint8_t> report,
                                  BridgeUsb &usb, std::uint32_t trace_flags,
                                  Logger &logger);
+// Caches a feature report without sending it to the host.
+void bridge_store_feature_report(BridgePort &port,
+                                 std::span<const std::uint8_t> report);
 // Caches a feature report and hands it to the host (initial priming).
 void bridge_cache_feature_report(BridgePort &port,
                                  std::span<const std::uint8_t> report,
@@ -276,8 +279,10 @@ bool bridge_flush_audio(BridgePort &port, BridgeBluetooth &bt,
 // Queues the WebHID speaker test tone while it is on.
 void bridge_enqueue_waveout(BridgePort &port, std::uint32_t trace_flags,
                             Logger &logger);
-// Milliseconds until this port needs service again (0: now), or nullopt
-// when it has nothing scheduled.
+// When this port next needs service (at or before `now`: immediately), or
+// nullopt when it has nothing scheduled; bridge_wakeup_ms in milliseconds.
+std::optional<BridgeClock::time_point>
+bridge_next_wakeup(const BridgePort &port, BridgeClock::time_point now);
 std::optional<int> bridge_wakeup_ms(const BridgePort &port,
                                     BridgeClock::time_point now);
 

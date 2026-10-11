@@ -1210,4 +1210,50 @@ std::string describe_bluetooth_lookup(const std::string &address) {
   return text;
 }
 
+bool disconnect_bluetooth_device(const std::string &address) {
+  // IOCTL_BTH_DISCONNECT_DEVICE from bthioctl.h (input: the device's BTH_ADDR).
+  constexpr DWORD kIoctlBthDisconnectDevice = 0x41000c;
+  ULONGLONG bth_address = 0;
+  int digits = 0;
+  for (const char c : address) {
+    int value = 0;
+    if (c >= '0' && c <= '9') {
+      value = c - '0';
+    } else if (c >= 'a' && c <= 'f') {
+      value = c - 'a' + 10;
+    } else if (c >= 'A' && c <= 'F') {
+      value = c - 'A' + 10;
+    } else {
+      continue;
+    }
+    bth_address = (bth_address << 4) | static_cast<ULONGLONG>(value);
+    ++digits;
+  }
+  if (digits != 12) {
+    throw std::runtime_error("invalid Bluetooth address " + address);
+  }
+
+  BLUETOOTH_FIND_RADIO_PARAMS params{};
+  params.dwSize = sizeof(params);
+  HANDLE radio = nullptr;
+  HBLUETOOTH_RADIO_FIND find = BluetoothFindFirstRadio(&params, &radio);
+  if (find == nullptr) {
+    return false;
+  }
+  bool disconnected = false;
+  while (radio != nullptr) {
+    DWORD returned = 0;
+    disconnected = DeviceIoControl(radio, kIoctlBthDisconnectDevice,
+                                   &bth_address, sizeof(bth_address), nullptr,
+                                   0, &returned, nullptr) != FALSE;
+    CloseHandle(radio);
+    radio = nullptr;
+    if (disconnected || !BluetoothFindNextRadio(find, &radio)) {
+      break;
+    }
+  }
+  BluetoothFindRadioClose(find);
+  return disconnected;
+}
+
 } // namespace vds::win

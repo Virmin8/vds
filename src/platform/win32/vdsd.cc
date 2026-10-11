@@ -30,6 +30,7 @@
 #include <windows.h>
 
 #include <mmsystem.h>
+#include <sddl.h>
 
 #include "jsonl.hh"
 #include "uapi/vds.h"
@@ -37,6 +38,7 @@
 #include "vds/ds5_protocol.h"
 #include "vds_bt.hh"
 #include "vds_build_info.hh"
+#include "vds_bridge.hh"
 #include "vds_common.hh"
 #include "vds_config.hh"
 #include "vds_hidhide.hh"
@@ -52,9 +54,6 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
-using vds::duration_us;
-using vds::hex_bytes;
-using vds::hex_u8;
 
 constexpr const char *kDefaultControlPipe = R"(\\.\pipe\vdsd)";
 constexpr const char *kVirtualPortProviderUnavailableReason =
@@ -65,65 +64,23 @@ constexpr const char *kWindowsHidHideProviderUnavailable =
     "HidHide is not installed or HidHideCLI.exe is unavailable";
 constexpr DWORD kDeviceShareMode =
     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-constexpr std::size_t kMaxPendingAudioChunks = 64;
-constexpr std::size_t kAudioPrimeChunks = 24;
-constexpr std::size_t kAudioFreshQueueChunks = 48;
-constexpr std::size_t kAudioLowWatermarkChunks = 0;
-constexpr std::size_t kAudioHighWatermarkChunks = 44;
-constexpr std::size_t kWindowsPcmWindowFrames = vds::kPcmWindowFrames;
-constexpr int kWindowsHapticsSampleMin = -128;
-constexpr int kWindowsHapticsSampleMax = 127;
-constexpr auto kAudioOutputBaseInterval = std::chrono::microseconds(
-    (static_cast<std::int64_t>(kWindowsPcmWindowFrames) * 1000000 +
-     VDS_AUDIO_SAMPLE_RATE / 2) /
-    VDS_AUDIO_SAMPLE_RATE);
-constexpr auto kAudioJitterBufferMaxDelay = std::chrono::milliseconds(300);
-constexpr auto kAudioUnderflowKeepaliveDelay = std::chrono::milliseconds(25);
-constexpr auto kAudioLowWatermarkPaceDelay = std::chrono::microseconds(0);
-constexpr auto kAudioHighWatermarkCatchupDelay = std::chrono::microseconds(0);
 constexpr auto kBridgeOpenRetryDelay = std::chrono::milliseconds(1000);
 constexpr auto kBridgeWorkerFailureRetryDelay = std::chrono::milliseconds(1000);
-constexpr auto kAudioFlushIdleSleep = std::chrono::milliseconds(2);
-constexpr auto kAudioFlushMinimumSleep = std::chrono::microseconds(100);
-constexpr auto kAudioWriteSlowWarn = std::chrono::milliseconds(5);
-constexpr auto kAudioSendGapWarn = std::chrono::milliseconds(15);
-constexpr auto kAudioSummaryInterval = std::chrono::seconds(1);
 constexpr UINT kWindowsTimerResolutionMs = 1;
 constexpr const char *kServiceName = "vdsd";
-constexpr std::uint8_t kTestCommandReportId = 0x80;
-constexpr std::uint8_t kTestCommandResultReportId = 0x81;
-constexpr std::uint8_t kTestCommandCompleteStatus = 0x02;
-constexpr std::uint8_t kTestCommandAudioDevice = 0x06;
-constexpr std::uint8_t kTestCommandWaveoutPrepare = 0x04;
-constexpr std::uint8_t kTestCommandWaveoutControl = 0x02;
-constexpr std::uint8_t kTestCommandSpeakerParam = 0x08;
-constexpr std::size_t kUsbInputMuteButtonOffset = 10;
-constexpr std::size_t kUsbInputHeadsetOffset = 54;
-constexpr std::uint8_t kUsbInputHeadphonesPluggedMask = 0x01;
-constexpr std::uint8_t kUsbInputMicPluggedMask = 0x02;
-constexpr std::uint8_t kUsbInputMuteButtonMask = 0x04;
-constexpr std::uint32_t kSpeakerWaveoutFrequencyHz = 1000;
-constexpr std::uint32_t kSpeakerWaveoutPeriodFrames =
-    VDS_AUDIO_SAMPLE_RATE / kSpeakerWaveoutFrequencyHz;
-constexpr double kSpeakerWaveoutTwoPi = 6.28318530717958647692;
-constexpr std::int16_t kSpeakerWaveoutAmplitude = 12000;
+constexpr std::array<std::uint8_t, 3> kInitialFeatureReportIds = {0x09, 0x20,
+                                                                  0x05};
+// Control requests carry a 64-byte companion report as a JSON array.
+constexpr std::size_t kMaxControlRequest = 8192;
 std::atomic_bool g_stop_requested = false;
 HANDLE g_stop_event = nullptr;
 SERVICE_STATUS_HANDLE g_service_status_handle = nullptr;
 SERVICE_STATUS g_service_status{};
 DWORD g_service_exit_code = ERROR_SUCCESS;
 
-using vds::active_trace_name;
-using vds::kTraceAll;
-using vds::kTraceInputAudio;
-using vds::kTraceInputControl;
-using vds::kTraceOutput;
-using vds::trace_enabled;
-using vds::trace_scope_name;
 using vds::trim_command;
 
 using vds::bt_feature_to_usb_feature_reply;
-using vds::bt_input_to_usb_input;
 using vds::hidp_output_packet;
 using vds::win::BluetoothTransport;
 using vds::win::describe_bluetooth_lookup;
@@ -139,6 +96,8 @@ struct Options {
   std::string db_path;
   std::string log_path;
   std::string pipe = kDefaultControlPipe;
+  float speaker_boost_db = vds::kDefaultSpeakerBoostDb;
+  bool mic_enabled = false;
 };
 
 class TimerResolutionGuard {
@@ -161,57 +120,6 @@ public:
 private:
   UINT period_ms_ = 0;
   bool active_ = false;
-};
-
-class HighResolutionSleeper {
-public:
-  HighResolutionSleeper() {
-    timer_.reset(CreateWaitableTimerExA(nullptr, nullptr,
-                                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                        TIMER_MODIFY_STATE | SYNCHRONIZE));
-    if (!timer_) {
-      timer_.reset(CreateWaitableTimerExA(nullptr, nullptr, 0,
-                                          TIMER_MODIFY_STATE | SYNCHRONIZE));
-    }
-  }
-
-  HighResolutionSleeper(const HighResolutionSleeper &) = delete;
-  HighResolutionSleeper &operator=(const HighResolutionSleeper &) = delete;
-
-  bool active() const { return static_cast<bool>(timer_); }
-
-  void sleep_for(Clock::duration duration) {
-    if (duration <= Clock::duration::zero()) {
-      return;
-    }
-    if (!timer_) {
-      std::this_thread::sleep_for(duration);
-      return;
-    }
-
-    using HundredNanoseconds =
-        std::chrono::duration<long long, std::ratio<1, 10000000>>;
-    const auto ticks = std::max<long long>(
-        1, std::chrono::duration_cast<HundredNanoseconds>(duration).count());
-    LARGE_INTEGER due_time{};
-    due_time.QuadPart = -ticks;
-    if (!SetWaitableTimerEx(timer_.get(), &due_time, 0, nullptr, nullptr,
-                            nullptr, 0)) {
-      std::this_thread::sleep_for(duration);
-      return;
-    }
-
-    HANDLE wait_handles[2] = {timer_.get(), g_stop_event};
-    const DWORD wait_count = g_stop_event == nullptr ? 1 : 2;
-    const DWORD wait_result =
-        WaitForMultipleObjects(wait_count, wait_handles, FALSE, INFINITE);
-    if (wait_result == WAIT_OBJECT_0 + 1) {
-      CancelWaitableTimer(timer_.get());
-    }
-  }
-
-private:
-  UniqueHandle timer_;
 };
 
 class AudioThreadPriorityGuard {
@@ -277,141 +185,12 @@ private:
   bool mmcss_active_ = false;
 };
 
-vds::AudioChunk make_silent_audio_chunk() {
-  std::array<std::uint8_t, kWindowsPcmWindowFrames * VDS_AUDIO_CHANNELS *
-                               sizeof(std::int16_t)>
-      pcm{};
-  vds::PcmAudioExtractor extractor(kWindowsPcmWindowFrames);
-  std::vector<vds::AudioChunk> chunks = extractor.push_usb_audio(pcm);
-  if (chunks.size() != 1) {
-    throw std::runtime_error("failed to build silent audio keepalive chunk");
-  }
-  chunks.front().has_signal = false;
-  chunks.front().has_haptics_signal = false;
-  return chunks.front();
-}
-
-Clock::duration
-audio_output_interval_for_pending(std::size_t pending_chunks,
-                                  bool &low_watermark_pace,
-                                  bool &high_watermark_catchup) {
-  low_watermark_pace = false;
-  high_watermark_catchup = false;
-  if (pending_chunks <= kAudioLowWatermarkChunks) {
-    low_watermark_pace = true;
-    return kAudioOutputBaseInterval + kAudioLowWatermarkPaceDelay;
-  }
-  if (pending_chunks >= kAudioHighWatermarkChunks) {
-    high_watermark_catchup = true;
-    return kAudioOutputBaseInterval - kAudioHighWatermarkCatchupDelay;
-  }
-  return kAudioOutputBaseInterval;
-}
-
-struct BridgeState {
-  std::mutex mutex;
-  vds::DsOutputState output_state;
-  vds::PcmAudioExtractor extractor{kWindowsPcmWindowFrames};
-  vds::PcmAudioExtractor waveout_extractor{kWindowsPcmWindowFrames};
-  vds::MicAudioDecoder mic_decoder;
-  vds::HapticsPacketBuilder haptics_builder;
-  vds::AudioChunk silent_audio_chunk = make_silent_audio_chunk();
-  std::deque<vds::AudioChunk> pending_audio_chunks;
-  std::optional<vds::AudioChunk> last_audio_chunk;
-  std::array<std::vector<std::uint8_t>, 256> feature_cache;
-  std::array<bool, 256> feature_cached{};
-  Clock::time_point next_haptics_send_time{};
-  Clock::time_point last_audio_send_time{};
-  Clock::time_point last_audio_usb_frame_time{};
-  Clock::time_point audio_jitter_buffer_start{};
-  Clock::time_point audio_queue_empty_since{};
-  Clock::time_point audio_queue_drained_time{};
-  Clock::time_point audio_last_flush_time{};
-  Clock::time_point audio_last_summary_time{};
-  vds::DsState last_sent_state{};
-  vds::UsbInputReport last_logged_input_report{};
-  std::uint64_t usb_input_forward_count = 0;
-  std::uint64_t usb_input_change_log_count = 0;
-  std::uint64_t mic_input_forward_count = 0;
-  std::uint64_t mic_input_decode_fail_count = 0;
-  std::uint64_t audio_usb_frame_count = 0;
-  std::uint64_t audio_queued_count = 0;
-  std::uint64_t audio_sent_count = 0;
-  std::uint64_t audio_concealed_count = 0;
-  std::uint64_t audio_keepalive_sent_count = 0;
-  std::uint64_t audio_dropped_count = 0;
-  std::uint64_t audio_stale_dropped_count = 0;
-  std::uint64_t audio_blocked_count = 0;
-  std::uint64_t audio_keepalive_blocked_count = 0;
-  std::uint64_t audio_usb_gap_warn_count = 0;
-  std::uint64_t audio_send_gap_warn_count = 0;
-  std::uint64_t audio_underflow_count = 0;
-  std::uint64_t audio_underflow_refill_count = 0;
-  std::uint64_t audio_flush_gap_warn_count = 0;
-  std::uint64_t audio_low_watermark_pace_count = 0;
-  std::uint64_t audio_last_summary_usb_frame_count = 0;
-  std::uint64_t audio_last_summary_sent_count = 0;
-  std::uint64_t audio_last_summary_concealed_count = 0;
-  std::uint64_t audio_last_summary_keepalive_sent_count = 0;
-  std::uint64_t audio_last_summary_dropped_count = 0;
-  std::uint64_t audio_last_summary_blocked_count = 0;
-  std::uint64_t audio_last_summary_underflow_count = 0;
-  std::uint64_t audio_last_summary_usb_gap_warn_count = 0;
-  std::uint64_t audio_last_summary_send_gap_warn_count = 0;
-  std::uint64_t audio_last_summary_flush_gap_warn_count = 0;
-  std::uint64_t audio_last_summary_low_watermark_pace_count = 0;
-  Clock::duration audio_usb_max_gap{};
-  Clock::duration audio_send_max_gap{};
-  Clock::duration audio_underflow_max_gap{};
-  Clock::duration audio_flush_max_gap{};
-  bool have_last_sent_state = false;
-  bool have_last_logged_input_report = false;
-  bool have_last_audio_send_time = false;
-  bool audio_jitter_buffering = true;
-  bool audio_haptics_nonzero_seen = false;
-  bool audio_haptics_sent_seen = false;
-  bool audio_out_stream_active = false;
-  bool audio_in_stream_active = false;
-  bool mic_muted = false;
-  bool mute_button_down = false;
-  bool audio_pcm_stream_active = false;
-  bool audio_stream_had_pcm = false;
-  bool headset_plugged = false;
-  bool headset_mic_plugged = false;
-  bool waveout_speaker_selected = true;
-  bool waveout_active = false;
-  std::uint32_t waveout_phase = 0;
-  bool audio_queue_empty_reported = false;
-  bool audio_underflow_reported = false;
-};
-
-std::array<int, VDS_AUDIO_CHANNELS>
-pcm_channel_peaks(std::span<const std::uint8_t> payload) {
-  std::array<int, VDS_AUDIO_CHANNELS> peaks{};
-  constexpr std::size_t frame_size = VDS_AUDIO_CHANNELS * sizeof(std::int16_t);
-  const std::size_t frames = payload.size() / frame_size;
-  for (std::size_t frame = 0; frame < frames; ++frame) {
-    const std::uint8_t *base = payload.data() + frame * frame_size;
-    for (std::size_t channel = 0; channel < VDS_AUDIO_CHANNELS; ++channel) {
-      const auto low =
-          static_cast<std::uint16_t>(base[channel * sizeof(std::int16_t)]);
-      const auto high =
-          static_cast<std::uint16_t>(base[channel * sizeof(std::int16_t) + 1])
-          << 8;
-      const auto sample = static_cast<std::int16_t>(low | high);
-      const int value =
-          sample < 0 ? -static_cast<int>(sample) : static_cast<int>(sample);
-      peaks[channel] = std::max(peaks[channel], value);
-    }
-  }
-  return peaks;
-}
-
 Options parse_platform_args(int argc, char **argv) {
   Options options;
   vds::VdsdCommonOptions common = vds::default_vdsd_common_options();
   const std::string platform_options =
-      std::string("[--pipe ") + kDefaultControlPipe + "]";
+      std::string("[--pipe ") + kDefaultControlPipe +
+      "] [--speaker-boost-db 0-18] [--mic|--no-mic]";
   const auto next_value = [&](int &index, std::string_view option) {
     if (index + 1 >= argc) {
       throw std::runtime_error(std::string(option) + " requires a value");
@@ -429,6 +208,21 @@ Options parse_platform_args(int argc, char **argv) {
       }
     } else if (arg == "--pipe") {
       options.pipe = next_value(i, arg);
+    } else if (arg == "--speaker-boost-db") {
+      const std::string value = next_value(i, arg);
+      try {
+        options.speaker_boost_db = std::stof(value);
+      } catch (const std::exception &) {
+        throw std::runtime_error("--speaker-boost-db needs a number");
+      }
+      if (options.speaker_boost_db < 0.0f ||
+          options.speaker_boost_db > vds::kMaxSpeakerBoostDb) {
+        throw std::runtime_error("--speaker-boost-db must be 0-18");
+      }
+    } else if (arg == "--mic") {
+      options.mic_enabled = true;
+    } else if (arg == "--no-mic") {
+      options.mic_enabled = false;
     } else {
       throw std::runtime_error("unknown option: " + std::string(arg));
     }
@@ -637,102 +431,97 @@ std::uint32_t resolve_virtual_port_profile(const vds::ControllerConfig &config,
   return device->profile;
 }
 
-bool input_controls_changed(const vds::UsbInputReport &left,
-                            const vds::UsbInputReport &right) {
-  for (std::size_t index = 1; index <= 10; ++index) {
-    if (left[index] != right[index]) {
-      return true;
+/*
+ * Bridge sessions. Each controller runs three threads around vds_bridge:
+ * virtual USB frames in, Bluetooth packets in, and the paced audio/haptics
+ * sender. g_bridge_mutex guards bridge_settings(), the companion runtime and
+ * every session's port, so those threads and the control pipe all go through
+ * vds_bridge under it (as the Linux event loop does on one thread).
+ */
+std::mutex g_bridge_mutex;
+vds::CompanionRuntime g_companion;
+
+// vds_bridge's view of the HID Bluetooth transport. Writes go through the
+// transport's output queue; feature reports are read directly.
+class WinBridgeBluetooth final : public vds::BridgeBluetooth {
+public:
+  WinBridgeBluetooth(BluetoothTransport &bluetooth, std::mutex &mutex,
+                     vds::Logger &logger)
+      : bluetooth_(bluetooth), mutex_(mutex), logger_(logger) {}
+
+  bool try_send_output_report(std::span<const std::uint8_t> report) override {
+    try {
+      std::lock_guard guard(mutex_);
+      return bluetooth_.try_write_interrupt_packet(hidp_output_packet(report));
+    } catch (const std::exception &error) {
+      logger_.log(vds::LogScope::Output, vds::LogLevel::Warn,
+                  std::string("output report ignored: ") + error.what());
+      return false;
     }
   }
-  return false;
-}
 
-std::string input_report_summary(const vds::UsbInputReport &report) {
-  return "lx=" + std::to_string(report[1]) +
-         " ly=" + std::to_string(report[2]) +
-         " rx=" + std::to_string(report[3]) +
-         " ry=" + std::to_string(report[4]) +
-         " l2=" + std::to_string(report[5]) +
-         " r2=" + std::to_string(report[6]) +
-         " seq=" + std::to_string(report[7]) + " b0=" + hex_u8(report[8]) +
-         " b1=" + hex_u8(report[9]) + " b2=" + hex_u8(report[10]);
-}
-
-void cache_feature_report(BridgeState &state,
-                          std::span<const std::uint8_t> report) {
-  if (report.empty()) {
-    return;
-  }
-
-  std::lock_guard guard(state.mutex);
-  state.feature_cache[report[0]].assign(report.begin(), report.end());
-  state.feature_cached[report[0]] = true;
-}
-
-std::optional<std::vector<std::uint8_t>>
-cached_feature_report(BridgeState &state, std::uint8_t report_id) {
-  std::lock_guard guard(state.mutex);
-  if (!state.feature_cached[report_id]) {
-    return std::nullopt;
-  }
-  return state.feature_cache[report_id];
-}
-
-bool try_send_bt_output_report(BluetoothTransport &bluetooth,
-                               std::span<const std::uint8_t> report,
-                               vds::Logger &logger, std::mutex &bluetooth_mutex,
-                               std::string_view label) {
-  const auto start = Clock::now();
-  bool sent = false;
-  try {
-    std::lock_guard guard(bluetooth_mutex);
-    const std::vector<std::uint8_t> packet = hidp_output_packet(report);
-    if (label == "audio") {
-      sent = bluetooth.try_write_interrupt_packet(packet);
-    } else {
-      bluetooth.write_interrupt_packet(packet);
-      sent = true;
+  std::optional<std::vector<std::uint8_t>>
+  get_feature_report(std::uint8_t report_id) override {
+    try {
+      std::lock_guard guard(mutex_);
+      return bluetooth_.read_feature_report(report_id);
+    } catch (const std::exception &error) {
+      logger_.log(vds::LogScope::Usb, vds::LogLevel::Warn,
+                  "feature get report_id=" + std::to_string(report_id) +
+                      " failed: " + error.what());
+      return std::nullopt;
     }
-  } catch (const std::exception &error) {
-    logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
-               std::string(label) + " output report ignored: " + error.what());
-    return false;
   }
 
-  const auto duration = Clock::now() - start;
-  if (duration >= kAudioWriteSlowWarn) {
-    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
-               std::string(label) + " output write slow us=" +
-                   std::to_string(duration_us(duration)));
+  void set_feature_report(std::span<const std::uint8_t> report) override {
+    try {
+      std::lock_guard guard(mutex_);
+      bluetooth_.write_feature_report(report);
+    } catch (const std::exception &error) {
+      logger_.log(vds::LogScope::Usb, vds::LogLevel::Warn,
+                  std::string("feature set failed: ") + error.what());
+    }
   }
-  return sent;
-}
 
-std::optional<vds::BtStateReport>
-build_bt_state_if_changed(BridgeState &state) {
-  std::lock_guard guard(state.mutex);
-  const vds::DsState current = state.output_state.state();
-  if (state.have_last_sent_state && state.last_sent_state == current) {
-    return std::nullopt;
-  }
-  const auto report = state.output_state.build_bt_state_report();
-  state.last_sent_state = current;
-  state.have_last_sent_state = true;
-  return report;
-}
+private:
+  BluetoothTransport &bluetooth_;
+  std::mutex &mutex_;
+  vds::Logger &logger_;
+};
 
-void send_bt_state_if_changed(BluetoothTransport &bluetooth, BridgeState &state,
-                              vds::Logger &logger,
-                              std::mutex &bluetooth_mutex) {
-  const auto report = build_bt_state_if_changed(state);
-  if (report) {
-    (void)try_send_bt_output_report(bluetooth, *report, logger, bluetooth_mutex,
-                                    "state");
+// vds_bridge's view of the usbip virtual controller.
+class WinBridgeUsb final : public vds::BridgeUsb {
+public:
+  explicit WinBridgeUsb(HANDLE device) : device_(device) {}
+
+  bool write_frame(std::uint32_t type,
+                   std::span<const std::uint8_t> payload) override {
+    vds::win::write_handle_frame(device_, static_cast<std::uint16_t>(type),
+                                 payload, "virtual", handle_io_cancellation());
+    return true;
   }
+
+private:
+  HANDLE device_;
+};
+
+struct BridgeSession {
+  vds::BridgePort port;
+  std::string address;
+  WinBridgeBluetooth *bt = nullptr;
+  // Wakes the audio thread to re-check its schedule (new audio, settings).
+  HANDLE audio_wake = nullptr;
+};
+
+// Sessions with a connected controller; guarded by g_bridge_mutex.
+std::vector<BridgeSession *> g_sessions;
+
+std::uint32_t load_trace_flags(const std::atomic_uint32_t *trace_flags) {
+  return trace_flags == nullptr ? 0 : trace_flags->load();
 }
 
 void request_bridge_restart(HANDLE virtual_device,
-                            BluetoothTransport *bluetooth,
+                            BluetoothTransport *bluetooth, HANDLE audio_wake,
                             std::atomic_bool &bridge_restart_requested) {
   if (bridge_restart_requested.exchange(true)) {
     return;
@@ -743,1295 +532,138 @@ void request_bridge_restart(HANDLE virtual_device,
   if (bluetooth != nullptr) {
     bluetooth->cancel();
   }
-}
-
-void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
-                          BridgeState &state, const Frame &frame,
-                          vds::Logger &logger, std::mutex &bluetooth_mutex,
-                          std::atomic_bool &bridge_restart_requested) {
-  if (frame.header.type == VDS_FRAME_USB_INTERFACE) {
-    if (frame.payload.size() != sizeof(vds_usb_interface_event)) {
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
-                 "malformed USB interface frame length=" +
-                     std::to_string(frame.payload.size()));
-      return;
-    }
-
-    vds_usb_interface_event event{};
-    std::memcpy(&event, frame.payload.data(), sizeof(event));
-    if (event.interface_type == VDS_USB_INTERFACE_AUDIO_OUT) {
-      {
-        std::lock_guard guard(state.mutex);
-        const bool active = event.altsetting != 0;
-        if (active) {
-          state.waveout_active = false;
-        }
-        state.output_state.set_audio_out_stream_active(
-            active || state.waveout_active, state.headset_plugged);
-        state.audio_out_stream_active = active;
-        state.audio_pcm_stream_active = false;
-        state.audio_stream_had_pcm = false;
-        state.audio_jitter_buffering = active;
-        state.audio_jitter_buffer_start = {};
-        state.audio_queue_empty_since = {};
-        state.audio_queue_drained_time = {};
-        state.have_last_audio_send_time = false;
-        state.last_audio_usb_frame_time = {};
-        state.audio_last_flush_time = {};
-        state.audio_last_summary_time = {};
-        state.last_audio_chunk.reset();
-        state.audio_usb_max_gap = {};
-        state.audio_send_max_gap = {};
-        state.audio_underflow_max_gap = {};
-        state.audio_flush_max_gap = {};
-        state.audio_usb_gap_warn_count = 0;
-        state.audio_send_gap_warn_count = 0;
-        state.audio_flush_gap_warn_count = 0;
-        state.audio_low_watermark_pace_count = 0;
-        state.audio_last_summary_usb_frame_count = 0;
-        state.audio_last_summary_sent_count = 0;
-        state.audio_last_summary_concealed_count = 0;
-        state.audio_last_summary_keepalive_sent_count = 0;
-        state.audio_last_summary_dropped_count = 0;
-        state.audio_last_summary_blocked_count = 0;
-        state.audio_last_summary_underflow_count = 0;
-        state.audio_last_summary_usb_gap_warn_count = 0;
-        state.audio_last_summary_send_gap_warn_count = 0;
-        state.audio_last_summary_flush_gap_warn_count = 0;
-        state.audio_last_summary_low_watermark_pace_count = 0;
-        state.audio_haptics_sent_seen = false;
-        state.audio_queue_empty_reported = false;
-        state.audio_underflow_reported = false;
-        state.pending_audio_chunks.clear();
-        state.next_haptics_send_time = {};
-        if (active) {
-          state.extractor = vds::PcmAudioExtractor{kWindowsPcmWindowFrames};
-        }
-        if (!active) {
-          state.audio_queue_empty_since = {};
-          state.audio_queue_drained_time = {};
-        }
-      }
-      logger.log(vds::LogScope::Output, vds::LogLevel::Info,
-                 "audio out interface altsetting=" +
-                     std::to_string(event.altsetting));
-      if (event.altsetting != 0) {
-        (void)bluetooth.take_output_diagnostics(true);
-      }
-      send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
-    } else if (event.interface_type == VDS_USB_INTERFACE_AUDIO_IN) {
-      const bool active = event.altsetting != 0;
-      bool active_audio_in_release = false;
-      vds::BtInitReport report{};
-      {
-        std::lock_guard guard(state.mutex);
-        if (active) {
-          state.audio_in_stream_active = true;
-        } else {
-          active_audio_in_release = state.audio_in_stream_active;
-          state.audio_in_stream_active = false;
-        }
-        state.mic_decoder = vds::MicAudioDecoder{};
-        state.output_state.set_headset_mic_plugged(state.headset_mic_plugged);
-        report = state.output_state.build_bt_mic_report(active);
-      }
-      vds::BtStateReport state_report{};
-      {
-        std::lock_guard guard(state.mutex);
-        state_report = state.output_state.build_bt_mic_state_report(
-            active, state.mic_muted);
-      }
-      try_send_bt_output_report(bluetooth, state_report, logger,
-                                bluetooth_mutex, "mic state");
-      const bool sent = try_send_bt_output_report(bluetooth, report, logger,
-                                                  bluetooth_mutex, "mic");
-      logger.log(
-          vds::LogScope::InputAudio, vds::LogLevel::Info,
-          "mic " + std::string(active ? "open" : "close") +
-              " sent=" + std::string(sent ? "yes" : "no") +
-              " interface_altsetting=" + std::to_string(event.altsetting));
-      if (active_audio_in_release) {
-        logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
-                   "audio in endpoint released");
-      }
-    }
-    return;
-  }
-
-  if (frame.header.type == VDS_FRAME_USB_HID_OUT) {
-    bool applied = false;
-    {
-      std::lock_guard guard(state.mutex);
-      applied = state.output_state.apply_usb_output_report(frame.payload);
-      if (applied && (state.audio_out_stream_active || state.waveout_active)) {
-        state.output_state.set_audio_out_stream_active(
-            true, state.waveout_active ? !state.waveout_speaker_selected
-                                       : state.headset_plugged);
-      }
-    }
-    std::string message =
-        "hid out length=" + std::to_string(frame.payload.size()) +
-        " applied=" + (applied ? "yes" : "no");
-    if (!frame.payload.empty()) {
-      message += " report_id=" + std::to_string(frame.payload[0]);
-    }
-    logger.log(vds::LogScope::Usb, vds::LogLevel::Info, message);
-    if (applied) {
-      send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
-    }
-    return;
-  }
-
-  if (frame.header.type == VDS_FRAME_USB_FEATURE_GET) {
-    if (frame.payload.empty()) {
-      return;
-    }
-    const std::uint8_t report_id = frame.payload[0];
-    if (const auto cached = cached_feature_report(state, report_id)) {
-      vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_FEATURE_REPLY,
-                                   *cached, "virtual",
-                                   handle_io_cancellation());
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
-                 "feature get report_id=" + std::to_string(report_id) +
-                     " cache=hit bluetooth_forward=no");
-      return;
-    }
-
-    try {
-      std::optional<std::vector<std::uint8_t>> report;
-      {
-        std::lock_guard guard(bluetooth_mutex);
-        report = bluetooth.read_feature_report(report_id);
-      }
-      if (report) {
-        cache_feature_report(state, *report);
-        vds::win::write_handle_frame(virtual_device,
-                                     VDS_FRAME_USB_FEATURE_REPLY, *report,
-                                     "virtual", handle_io_cancellation());
-      }
-      logger.log(
-          vds::LogScope::Usb, vds::LogLevel::Info,
-          "feature get report_id=" + std::to_string(report_id) +
-              " cache=miss bluetooth_forward=" + (report ? "yes" : "no"));
-    } catch (const std::exception &error) {
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
-                 "feature get report_id=" + std::to_string(report_id) +
-                     " failed: " + error.what());
-    }
-    return;
-  }
-
-  if (frame.header.type == VDS_FRAME_USB_FEATURE_SET) {
-    std::string message =
-        "feature set length=" + std::to_string(frame.payload.size());
-    if (!frame.payload.empty()) {
-      message += " report_id=" + std::to_string(frame.payload[0]);
-    }
-    logger.log(vds::LogScope::Usb, vds::LogLevel::Info, message);
-    if (frame.payload.empty() || frame.payload[0] == 0) {
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
-                 "ignoring malformed feature set report");
-      return;
-    }
-    const std::uint8_t report_id = frame.payload[0];
-    bool synthetic_test_command = false;
-
-    if (frame.payload.size() >= 3 && report_id == kTestCommandReportId) {
-      std::size_t command_offset = 1;
-      if (frame.payload.size() > command_offset &&
-          frame.payload[command_offset] == kTestCommandReportId) {
-        ++command_offset;
-      }
-      if (frame.payload.size() > command_offset + 1) {
-        const std::uint8_t command_device = frame.payload[command_offset];
-        const std::uint8_t command_action = frame.payload[command_offset + 1];
-        const std::size_t command_data_offset = command_offset + 2;
-        synthetic_test_command = true;
-
-        std::array<std::uint8_t, VDS_USB_INPUT_REPORT_SIZE> test_result{};
-        test_result[0] = kTestCommandResultReportId;
-        test_result[1] = command_device;
-        test_result[2] = command_action;
-        test_result[3] = kTestCommandCompleteStatus;
-        cache_feature_report(state, test_result);
-        logger.log(
-            vds::LogScope::Usb, vds::LogLevel::Info,
-            "WebHID test command device=" + std::to_string(command_device) +
-                " action=" + std::to_string(command_action));
-
-        bool update_bt_state = false;
-        std::string waveout_message;
-        {
-          std::lock_guard guard(state.mutex);
-          if (command_device == kTestCommandAudioDevice &&
-              command_action == kTestCommandWaveoutPrepare) {
-            state.waveout_speaker_selected =
-                frame.payload.size() > command_data_offset + 2 &&
-                frame.payload[command_data_offset + 2] ==
-                    kTestCommandSpeakerParam;
-            waveout_message =
-                std::string("WebHID waveout target=") +
-                (state.waveout_speaker_selected ? "speaker" : "headphone");
-          } else if (command_device == kTestCommandAudioDevice &&
-                     command_action == kTestCommandWaveoutControl &&
-                     frame.payload.size() > command_data_offset) {
-            const bool enable = frame.payload[command_data_offset] != 0;
-            state.waveout_active = enable;
-            state.waveout_phase = 0;
-            state.waveout_extractor =
-                vds::PcmAudioExtractor{kWindowsPcmWindowFrames};
-            state.output_state.set_audio_out_stream_active(
-                enable, !state.waveout_speaker_selected);
-            state.audio_out_stream_active = enable;
-            state.audio_pcm_stream_active = enable;
-            state.audio_jitter_buffering = enable;
-            state.audio_queue_empty_since = {};
-            state.audio_queue_drained_time = {};
-            state.have_last_audio_send_time = false;
-            state.last_audio_chunk.reset();
-            if (!enable) {
-              state.pending_audio_chunks.clear();
-            }
-            update_bt_state = true;
-            waveout_message =
-                std::string("WebHID waveout ") + (enable ? "on" : "off") +
-                " target=" +
-                (state.waveout_speaker_selected ? "speaker" : "headphone") +
-                " synthesized=" + (enable ? "yes" : "no");
-          }
-        }
-        if (!waveout_message.empty()) {
-          logger.log(vds::LogScope::Output, vds::LogLevel::Info,
-                     waveout_message);
-        }
-        if (update_bt_state) {
-          send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
-        }
-      }
-    }
-
-    if (synthetic_test_command) {
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
-                 "feature set report_id=" + std::to_string(report_id) +
-                     " bluetooth_forward=no reason=synthetic_webhid_test");
-      return;
-    }
-
-    try {
-      std::lock_guard guard(bluetooth_mutex);
-      bluetooth.write_feature_report(frame.payload);
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
-                 "feature set report_id=" + std::to_string(report_id) +
-                     " bluetooth_forward=yes");
-    } catch (const std::exception &error) {
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
-                 "feature set report_id=" + std::to_string(report_id) +
-                     " failed: " + error.what());
-    }
-    return;
-  }
-
-  if (frame.header.type != VDS_FRAME_USB_AUDIO_OUT) {
-    return;
-  }
-
-  const auto audio_start = Clock::now();
-  const auto peaks = pcm_channel_peaks(frame.payload);
-  std::size_t queued_chunks = 0;
-  std::size_t dropped_chunks = 0;
-  std::size_t pending_chunks = 0;
-  std::uint64_t audio_frame_count = 0;
-  std::uint64_t dropped_total = 0;
-  std::uint64_t underflow_refill_count = 0;
-  Clock::duration underflow_refill_gap{};
-  Clock::duration underflow_refill_max_gap{};
-  bool haptics_nonzero_first_seen = false;
-  bool audio_route_activated = false;
-  bool underflow_refilled = false;
-  bool log_dropped_summary = false;
-  bool audio_pcm_stream_started = false;
-  const auto extract_start = Clock::now();
-  std::vector<vds::AudioChunk> chunks;
-  {
-    std::lock_guard guard(state.mutex);
-    const bool reset_audio_route =
-        !state.audio_out_stream_active || state.waveout_active;
-    if (reset_audio_route) {
-      state.waveout_active = false;
-      state.output_state.set_audio_out_stream_active(true,
-                                                     state.headset_plugged);
-      state.audio_out_stream_active = true;
-      state.audio_pcm_stream_active = false;
-      state.audio_stream_had_pcm = false;
-      state.audio_jitter_buffering = true;
-      state.audio_jitter_buffer_start = {};
-      state.audio_queue_empty_since = {};
-      state.audio_queue_drained_time = {};
-      state.have_last_audio_send_time = false;
-      state.last_audio_usb_frame_time = {};
-      state.audio_last_flush_time = {};
-      state.audio_last_summary_time = {};
-      state.last_audio_chunk.reset();
-      state.audio_usb_max_gap = {};
-      state.audio_send_max_gap = {};
-      state.audio_underflow_max_gap = {};
-      state.audio_flush_max_gap = {};
-      state.audio_usb_gap_warn_count = 0;
-      state.audio_send_gap_warn_count = 0;
-      state.audio_flush_gap_warn_count = 0;
-      state.audio_low_watermark_pace_count = 0;
-      state.audio_last_summary_usb_frame_count = 0;
-      state.audio_last_summary_sent_count = 0;
-      state.audio_last_summary_concealed_count = 0;
-      state.audio_last_summary_keepalive_sent_count = 0;
-      state.audio_last_summary_dropped_count = 0;
-      state.audio_last_summary_blocked_count = 0;
-      state.audio_last_summary_underflow_count = 0;
-      state.audio_last_summary_usb_gap_warn_count = 0;
-      state.audio_last_summary_send_gap_warn_count = 0;
-      state.audio_last_summary_flush_gap_warn_count = 0;
-      state.audio_last_summary_low_watermark_pace_count = 0;
-      state.audio_haptics_sent_seen = false;
-      state.audio_underflow_reported = false;
-      state.pending_audio_chunks.clear();
-      state.next_haptics_send_time = {};
-      state.extractor = vds::PcmAudioExtractor{kWindowsPcmWindowFrames};
-      audio_route_activated = true;
-    }
-    chunks = state.extractor.push_usb_audio(frame.payload);
-    const auto extract_duration = Clock::now() - extract_start;
-    if (!chunks.empty() && !state.audio_pcm_stream_active) {
-      state.audio_pcm_stream_active = true;
-      state.audio_stream_had_pcm = true;
-      state.audio_jitter_buffering = true;
-      state.audio_jitter_buffer_start = {};
-      state.audio_queue_empty_since = {};
-      state.audio_queue_drained_time = {};
-      state.have_last_audio_send_time = false;
-      state.last_audio_usb_frame_time = {};
-      state.audio_last_flush_time = {};
-      state.audio_last_summary_time = {};
-      state.last_audio_chunk.reset();
-      state.audio_usb_max_gap = {};
-      state.audio_send_max_gap = {};
-      state.audio_underflow_max_gap = {};
-      state.audio_flush_max_gap = {};
-      state.audio_usb_gap_warn_count = 0;
-      state.audio_send_gap_warn_count = 0;
-      state.audio_flush_gap_warn_count = 0;
-      state.audio_low_watermark_pace_count = 0;
-      state.audio_last_summary_usb_frame_count = state.audio_usb_frame_count;
-      state.audio_last_summary_sent_count = state.audio_sent_count;
-      state.audio_last_summary_concealed_count = state.audio_concealed_count;
-      state.audio_last_summary_keepalive_sent_count =
-          state.audio_keepalive_sent_count;
-      state.audio_last_summary_dropped_count = state.audio_dropped_count;
-      state.audio_last_summary_blocked_count = state.audio_blocked_count;
-      state.audio_last_summary_underflow_count = state.audio_underflow_count;
-      state.audio_last_summary_usb_gap_warn_count = 0;
-      state.audio_last_summary_send_gap_warn_count = 0;
-      state.audio_last_summary_flush_gap_warn_count = 0;
-      state.audio_last_summary_low_watermark_pace_count = 0;
-      state.audio_haptics_sent_seen = false;
-      state.audio_underflow_reported = false;
-      state.pending_audio_chunks.clear();
-      state.next_haptics_send_time = {};
-      audio_pcm_stream_started = true;
-    }
-    if (!chunks.empty()) {
-      state.audio_stream_had_pcm = true;
-    }
-    ++state.audio_usb_frame_count;
-    audio_frame_count = state.audio_usb_frame_count;
-    if (state.last_audio_usb_frame_time != Clock::time_point{}) {
-      const auto frame_gap = audio_start - state.last_audio_usb_frame_time;
-      state.audio_usb_max_gap = std::max(state.audio_usb_max_gap, frame_gap);
-      if (frame_gap >= kAudioSendGapWarn) {
-        ++state.audio_usb_gap_warn_count;
-      }
-    }
-    state.last_audio_usb_frame_time = audio_start;
-    const bool haptics_nonzero = peaks[2] != 0 || peaks[3] != 0;
-    haptics_nonzero_first_seen =
-        haptics_nonzero && !state.audio_haptics_nonzero_seen;
-    state.audio_haptics_nonzero_seen |= haptics_nonzero;
-    if (!chunks.empty() && state.audio_underflow_reported) {
-      underflow_refilled = true;
-      ++state.audio_underflow_refill_count;
-      underflow_refill_count = state.audio_underflow_refill_count;
-      if (state.audio_queue_empty_since != Clock::time_point{}) {
-        underflow_refill_gap = audio_start - state.audio_queue_empty_since;
-        state.audio_underflow_max_gap =
-            std::max(state.audio_underflow_max_gap, underflow_refill_gap);
-        underflow_refill_max_gap = state.audio_underflow_max_gap;
-      }
-      state.audio_underflow_reported = false;
-    }
-
-    for (const auto &chunk : chunks) {
-      if (state.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
-        state.pending_audio_chunks.pop_front();
-        ++dropped_chunks;
-        ++state.audio_dropped_count;
-      }
-      state.pending_audio_chunks.push_back(chunk);
-      state.audio_queue_empty_reported = false;
-      state.audio_queue_empty_since = {};
-      state.audio_queue_drained_time = {};
-      ++queued_chunks;
-      ++state.audio_queued_count;
-    }
-    pending_chunks = state.pending_audio_chunks.size();
-    dropped_total = state.audio_dropped_count;
-    log_dropped_summary =
-        dropped_chunks > 0 &&
-        (dropped_total == dropped_chunks || dropped_total % 1000 == 0);
-
-    if (queued_chunks > 0 &&
-        (audio_frame_count == 1 || audio_pcm_stream_started ||
-         haptics_nonzero_first_seen || log_dropped_summary)) {
-      logger.log(vds::LogScope::Output, vds::LogLevel::Info,
-                 "audio out frame=" + std::to_string(audio_frame_count) +
-                     " bytes=" + std::to_string(frame.payload.size()) +
-                     " chunks=" + std::to_string(queued_chunks) +
-                     " pending=" + std::to_string(pending_chunks) +
-                     " dropped_total=" + std::to_string(dropped_total) +
-                     " peak_ch0=" + std::to_string(peaks[0]) +
-                     " peak_ch1=" + std::to_string(peaks[1]) +
-                     " peak_ch2=" + std::to_string(peaks[2]) +
-                     " peak_ch3=" + std::to_string(peaks[3]) + " extract_us=" +
-                     std::to_string(duration_us(extract_duration)) +
-                     " total_us=" +
-                     std::to_string(duration_us(Clock::now() - audio_start)) +
-                     " pcm_stream_started=" +
-                     (audio_pcm_stream_started ? "yes" : "no"));
-    }
-  }
-
-  if (log_dropped_summary) {
-    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
-               "dropped BT 0x36 audio packets dropped=" +
-                   std::to_string(dropped_chunks) +
-                   " total=" + std::to_string(dropped_total) +
-                   " pending=" + std::to_string(pending_chunks));
-  }
-  if (underflow_refilled) {
-    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
-               "audio packet queue refilled after underflow refill_count=" +
-                   std::to_string(underflow_refill_count) + " gap_us=" +
-                   std::to_string(duration_us(underflow_refill_gap)) +
-                   " max_gap_us=" +
-                   std::to_string(duration_us(underflow_refill_max_gap)));
-  }
-  if (audio_route_activated) {
-    (void)bluetooth.take_output_diagnostics(true);
-    logger.log(vds::LogScope::Output, vds::LogLevel::Info,
-               "audio out stream auto-activated by PCM frame");
-    send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
+  if (audio_wake != nullptr) {
+    SetEvent(audio_wake);
   }
 }
 
-void handle_bluetooth_frame(HANDLE virtual_device,
-                            BluetoothTransport &bluetooth, BridgeState &state,
-                            const Frame &frame, vds::Logger &logger,
-                            std::uint32_t trace_flags,
-                            std::mutex &bluetooth_mutex) {
-  if (frame.header.type == VDS_FRAME_BT_INTERRUPT_PACKET) {
-    if (vds::bt_input_payload_type(frame.payload) ==
-        vds::BtInputPayloadType::Audio) {
-      const bool input_audio_trace =
-          trace_enabled(trace_flags, kTraceInputAudio);
-      std::optional<std::vector<std::uint8_t>> pcm;
-      bool decode_failed = false;
-      {
-        std::lock_guard guard(state.mutex);
-        if (const auto opus_payload = vds::bt_mic_opus_payload(frame.payload)) {
-          try {
-            pcm = state.mic_decoder.decode(*opus_payload);
-          } catch (const std::exception &) {
-            ++state.mic_input_decode_fail_count;
-            decode_failed = true;
-          }
-        } else {
-          ++state.mic_input_decode_fail_count;
-          decode_failed = true;
-        }
-      }
-
-      if (decode_failed) {
-        if (input_audio_trace) {
-          logger.log(vds::LogScope::InputAudio, vds::LogLevel::Warn,
-                     "mic packet decode failed");
-        }
-        return;
-      }
-      if (pcm) {
-        for (std::size_t offset = 0; offset + 3 < pcm->size();
-             offset += 2 * sizeof(std::int16_t)) {
-          (*pcm)[offset + 0] = (*pcm)[offset + 2];
-          (*pcm)[offset + 1] = (*pcm)[offset + 3];
-        }
-
-        std::array<int, 2> pcm_peaks{};
-        for (std::size_t offset = 0; offset + 3 < pcm->size();
-             offset += 2 * sizeof(std::int16_t)) {
-          for (std::size_t channel = 0; channel < pcm_peaks.size(); ++channel) {
-            const std::size_t sample_offset =
-                offset + channel * sizeof(std::int16_t);
-            const auto raw =
-                static_cast<std::uint16_t>((*pcm)[sample_offset + 0]) |
-                (static_cast<std::uint16_t>((*pcm)[sample_offset + 1]) << 8);
-            const auto sample = static_cast<std::int16_t>(raw);
-            const int value = static_cast<int>(sample);
-            const int magnitude = value < 0 ? -value : value;
-            pcm_peaks[channel] = std::max(pcm_peaks[channel], magnitude);
-          }
-        }
-
-        vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_AUDIO_IN,
-                                     *pcm, "virtual", handle_io_cancellation());
-        std::uint64_t forwarded = 0;
-        {
-          std::lock_guard guard(state.mutex);
-          forwarded = ++state.mic_input_forward_count;
-        }
-        if (input_audio_trace && (forwarded == 1 || forwarded % 1000 == 0)) {
-          logger.log(vds::LogScope::InputAudio, vds::LogLevel::Debug,
-                     "mic forwarded count=" + std::to_string(forwarded) +
-                         " len=" + std::to_string(pcm->size()) +
-                         " peak_ch0=" + std::to_string(pcm_peaks[0]) +
-                         " peak_ch1=" + std::to_string(pcm_peaks[1]));
-        }
-      }
-      return;
-    }
-
-    const auto report = bt_input_to_usb_input(frame.payload);
-    if (report) {
-      vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_HID_IN,
-                                   *report, "virtual",
-                                   handle_io_cancellation());
-      const std::uint8_t headset_status = report->at(kUsbInputHeadsetOffset);
-      const bool headset_plugged =
-          (headset_status & kUsbInputHeadphonesPluggedMask) != 0;
-      const bool headset_mic_plugged =
-          (headset_status & kUsbInputMicPluggedMask) != 0;
-      const bool mute_button_down = (report->at(kUsbInputMuteButtonOffset) &
-                                     kUsbInputMuteButtonMask) != 0;
-      bool headset_changed = false;
-      bool headset_mic_changed = false;
-      bool mic_mute_changed = false;
-      bool mic_muted = false;
-      bool send_mic_state = false;
-      bool output_state_changed = false;
-      vds::BtStateReport mic_state_report{};
-      vds::BtInitReport mic_close_report{};
-      vds::BtInitReport mic_report{};
-      std::uint64_t forward_count = 0;
-      bool input_changed = false;
-      bool send_mic_close = false;
-      bool send_mic_open = false;
-      {
-        std::lock_guard guard(state.mutex);
-        forward_count = ++state.usb_input_forward_count;
-        input_changed =
-            !state.have_last_logged_input_report ||
-            input_controls_changed(state.last_logged_input_report, *report);
-        if (headset_plugged != state.headset_plugged) {
-          state.headset_plugged = headset_plugged;
-          headset_changed = true;
-          if (state.audio_out_stream_active || state.waveout_active) {
-            state.output_state.set_audio_out_stream_active(
-                true, state.waveout_active ? !state.waveout_speaker_selected
-                                           : state.headset_plugged);
-            output_state_changed = true;
-          }
-        }
-        if (headset_mic_plugged != state.headset_mic_plugged) {
-          state.headset_mic_plugged = headset_mic_plugged;
-          state.output_state.set_headset_mic_plugged(headset_mic_plugged);
-          headset_mic_changed = true;
-        }
-        if (mute_button_down && !state.mute_button_down) {
-          state.mic_muted = !state.mic_muted;
-          mic_mute_changed = true;
-        }
-        state.mute_button_down = mute_button_down;
-        mic_muted = state.mic_muted;
-        send_mic_state = mic_mute_changed ||
-                         (headset_mic_changed && state.audio_in_stream_active);
-        if (send_mic_state) {
-          mic_state_report = state.output_state.build_bt_mic_state_report(
-              state.audio_in_stream_active, state.mic_muted);
-        }
-        if (headset_mic_changed && state.audio_in_stream_active) {
-          mic_close_report = state.output_state.build_bt_mic_report(false);
-          mic_report = state.output_state.build_bt_mic_report(true);
-          send_mic_close = true;
-          send_mic_open = true;
-        }
-      }
-      if (mic_mute_changed) {
-        logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
-                   "mic " + std::string(mic_muted ? "muted" : "unmuted"));
-      }
-      if (send_mic_state) {
-        if (send_mic_close) {
-          try_send_bt_output_report(bluetooth, mic_close_report, logger,
-                                    bluetooth_mutex, "mic");
-        }
-        try_send_bt_output_report(bluetooth, mic_state_report, logger,
-                                  bluetooth_mutex, "mic state");
-      }
-      if (send_mic_open) {
-        try_send_bt_output_report(bluetooth, mic_report, logger,
-                                  bluetooth_mutex, "mic");
-      }
-      if (headset_changed) {
-        logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
-                   "headset " +
-                       std::string(headset_plugged ? "plugged" : "unplugged"));
-      }
-      if (headset_mic_changed) {
-        logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
-                   "headset mic " + std::string(headset_mic_plugged
-                                                    ? "plugged"
-                                                    : "unplugged"));
-      }
-      if (headset_changed || output_state_changed) {
-        send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
-      }
-      if (input_changed) {
-        std::uint64_t change_count = 0;
-        {
-          std::lock_guard guard(state.mutex);
-          state.last_logged_input_report = *report;
-          state.have_last_logged_input_report = true;
-          change_count = ++state.usb_input_change_log_count;
-        }
-        if (change_count == 1 ||
-            trace_enabled(trace_flags, kTraceInputControl)) {
-          logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
-                     "hid in changed count=" + std::to_string(change_count) +
-                         " forwarded=" + std::to_string(forward_count) + " " +
-                         input_report_summary(*report));
-        }
-      }
-      if (forward_count == 1 || forward_count % 1024 == 0) {
-        logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
-                   std::string("hid in forwarded count=") +
-                       std::to_string(forward_count));
-      }
-    }
-    return;
-  }
-
-  if (frame.header.type != VDS_FRAME_BT_CONTROL_PACKET) {
-    return;
-  }
-
-  logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
-             "control rx length=" + std::to_string(frame.payload.size()) +
-                 " prefix=" + hex_bytes(frame.payload, 8, ':', false));
-  const auto report = bt_feature_to_usb_feature_reply(frame.payload);
-  if (report) {
-    vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_FEATURE_REPLY,
-                                 *report, "virtual", handle_io_cancellation());
-    if (!report->empty()) {
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
-                 "feature reply report_id=" + std::to_string((*report)[0]) +
-                     " length=" + std::to_string(report->size()));
-    }
-  }
-}
-
-void send_initial_bluetooth_reports(BluetoothTransport &bluetooth,
-                                    BridgeState &state, vds::Logger &logger,
-                                    std::mutex &bluetooth_mutex) {
-  logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
-             "sending Windows startup Bluetooth output init report");
-  try_send_bt_output_report(bluetooth,
-                            state.output_state.build_bt_init_report(), logger,
-                            bluetooth_mutex, "init");
-  {
-    std::lock_guard guard(state.mutex);
-    state.audio_in_stream_active = false;
-    state.mic_decoder = vds::MicAudioDecoder{};
-    state.output_state.set_headset_mic_plugged(state.headset_mic_plugged);
-    state.last_sent_state = state.output_state.state();
-    state.have_last_sent_state = true;
-  }
-  logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
-             "startup mic stream inactive until USB capture opens");
-}
-
-void enqueue_waveout_chunk(BridgeState &state) {
-  std::lock_guard guard(state.mutex);
-  if (!state.waveout_active || !state.pending_audio_chunks.empty()) {
-    return;
-  }
-
-  std::array<std::uint8_t, kWindowsPcmWindowFrames * VDS_AUDIO_CHANNELS *
-                               sizeof(std::int16_t)>
-      pcm{};
-  for (std::size_t frame = 0; frame < kWindowsPcmWindowFrames; ++frame) {
-    const double angle = kSpeakerWaveoutTwoPi *
-                         static_cast<double>(state.waveout_phase) /
-                         static_cast<double>(kSpeakerWaveoutPeriodFrames);
-    const auto sample = static_cast<std::int16_t>(
-        std::sin(angle) * static_cast<double>(kSpeakerWaveoutAmplitude));
-    state.waveout_phase =
-        (state.waveout_phase + 1) % kSpeakerWaveoutPeriodFrames;
-
-    for (std::size_t channel = 0; channel < vds::kSpeakerChannels; ++channel) {
-      const std::size_t offset =
-          (frame * VDS_AUDIO_CHANNELS + channel) * sizeof(std::int16_t);
-      const auto value = static_cast<std::uint16_t>(sample);
-      pcm[offset + 0] = static_cast<std::uint8_t>(value & 0xff);
-      pcm[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xff);
-    }
-  }
-
-  const auto chunks = state.waveout_extractor.push_usb_audio(pcm);
-  for (const auto &chunk : chunks) {
-    if (state.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
-      break;
-    }
-    state.pending_audio_chunks.push_back(chunk);
-  }
-}
-
-Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
-                                          BridgeState &state,
-                                          vds::Logger &logger,
-                                          std::mutex &bluetooth_mutex) {
-  vds::BtReport packet{};
-  std::size_t pending_after_pop = 0;
-  std::uint64_t sent_count = 0;
-  std::uint64_t concealed_count = 0;
-  std::uint64_t keepalive_sent_count = 0;
-  std::uint64_t dropped_count = 0;
-  std::uint64_t stale_dropped_count = 0;
-  std::uint64_t blocked_count = 0;
-  std::size_t stale_dropped_now = 0;
-  bool has_signal = false;
-  bool has_haptics_signal = false;
-  bool have_gap = false;
-  bool sending_keepalive = false;
-  bool sending_concealment = false;
-  bool haptics_sent_first_seen = false;
-  bool haptics_limited = false;
-  bool low_watermark_paced = false;
-  bool high_watermark_catchup = false;
-  bool have_schedule_late = false;
-  bool schedule_reset = false;
-  Clock::duration send_interval = kAudioOutputBaseInterval;
-  Clock::duration send_gap{};
-  Clock::duration schedule_late{};
-  Clock::duration next_sleep{};
-  Clock::time_point scheduled_send_time{};
-  Clock::time_point send_time{};
-  vds::AudioChunk sent_audio_chunk{};
-  std::optional<vds::BtStateReport> stream_stop_report;
-  bool have_sent_audio_chunk = false;
-  bool audio_route_deactivated = false;
-
-  {
-    std::lock_guard guard(state.mutex);
-    const auto now = Clock::now();
-    if (state.pending_audio_chunks.empty()) {
-      if (!state.audio_out_stream_active || !state.audio_pcm_stream_active) {
-        return kAudioFlushIdleSleep;
-      }
-
-      state.audio_jitter_buffering = false;
-      state.audio_jitter_buffer_start = {};
-      if (state.audio_queue_empty_since == Clock::time_point{}) {
-        state.audio_queue_empty_since = now;
-      }
-      const auto empty_duration = now - state.audio_queue_empty_since;
-      if (state.next_haptics_send_time != Clock::time_point{} &&
-          now < state.next_haptics_send_time) {
-        const auto remaining = state.next_haptics_send_time - now;
-        return std::max<Clock::duration>(
-            kAudioFlushMinimumSleep,
-            std::min<Clock::duration>(kAudioFlushIdleSleep, remaining));
-      }
-      if (empty_duration < kAudioUnderflowKeepaliveDelay &&
-          state.last_audio_chunk) {
-        vds::AudioChunk chunk = *state.last_audio_chunk;
-        chunk.haptics.fill(0);
-        chunk.has_haptics_signal = false;
-        has_signal = chunk.has_signal;
-        packet = state.haptics_builder.build_packet(
-            chunk.haptics, chunk.speaker, state.output_state.state(), true,
-            state.waveout_active ? !state.waveout_speaker_selected
-                                 : state.headset_plugged);
-        sending_concealment = true;
-        scheduled_send_time =
-            state.next_haptics_send_time == Clock::time_point{}
-                ? now
-                : state.next_haptics_send_time;
-        send_time = now;
-      } else {
-        if (empty_duration < kAudioUnderflowKeepaliveDelay) {
-          const auto remaining = kAudioUnderflowKeepaliveDelay - empty_duration;
-          return std::max<Clock::duration>(
-              kAudioFlushMinimumSleep,
-              std::min<Clock::duration>(kAudioFlushIdleSleep, remaining));
-        }
-        if (!state.audio_underflow_reported && state.audio_sent_count != 0) {
-          ++state.audio_underflow_count;
-          state.audio_underflow_reported = true;
-          state.audio_queue_empty_reported = true;
-          state.audio_queue_drained_time = state.audio_queue_empty_since;
-          logger.log(
-              vds::LogScope::Output, vds::LogLevel::Warn,
-              "audio packet queue underflow during active stream count=" +
-                  std::to_string(state.audio_underflow_count) +
-                  " queued=" + std::to_string(state.audio_queued_count) +
-                  " sent=" + std::to_string(state.audio_sent_count) +
-                  " keepalive_sent=" +
-                  std::to_string(state.audio_keepalive_sent_count) +
-                  " dropped=" + std::to_string(state.audio_dropped_count) +
-                  " stale_dropped=" +
-                  std::to_string(state.audio_stale_dropped_count) +
-                  " blocked=" + std::to_string(state.audio_blocked_count) +
-                  " keepalive_blocked=" +
-                  std::to_string(state.audio_keepalive_blocked_count) +
-                  " usb_max_gap_us=" +
-                  std::to_string(duration_us(state.audio_usb_max_gap)) +
-                  " usb_gap_warn=" +
-                  std::to_string(state.audio_usb_gap_warn_count) +
-                  " send_max_gap_us=" +
-                  std::to_string(duration_us(state.audio_send_max_gap)) +
-                  " send_gap_warn=" +
-                  std::to_string(state.audio_send_gap_warn_count));
-          if (auto diagnostics = bluetooth.take_output_diagnostics(true)) {
-            logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
-                       *diagnostics);
-          }
-        }
-        state.audio_pcm_stream_active = false;
-        if (!state.waveout_active) {
-          state.output_state.set_audio_out_stream_active(false,
-                                                         state.headset_plugged);
-          state.audio_out_stream_active = false;
-          state.audio_jitter_buffering = false;
-          state.audio_queue_empty_since = {};
-          state.audio_queue_drained_time = {};
-          state.next_haptics_send_time = {};
-          state.last_audio_chunk.reset();
-
-          const vds::DsState current = state.output_state.state();
-          if (!state.have_last_sent_state || state.last_sent_state != current) {
-            stream_stop_report = state.output_state.build_bt_state_report();
-            state.last_sent_state = current;
-            state.have_last_sent_state = true;
-          }
-          audio_route_deactivated = true;
-        }
-        state.next_haptics_send_time = {};
-        next_sleep = kAudioFlushIdleSleep;
-      }
+// Turns a controller off (Turn Off Controller, Idle Disconnect).
+void power_off_controller(const std::string &address, std::string_view reason,
+                          vds::Logger &logger) {
+  try {
+    if (vds::win::disconnect_bluetooth_device(address)) {
+      logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
+                 "controller turned off address=" + address + " (" +
+                     std::string(reason) + ")");
     } else {
-      if (state.audio_jitter_buffering) {
-        if (state.audio_jitter_buffer_start == Clock::time_point{}) {
-          state.audio_jitter_buffer_start = now;
-        }
-        const auto buffer_age = now - state.audio_jitter_buffer_start;
-        if (state.pending_audio_chunks.size() < kAudioPrimeChunks &&
-            buffer_age < kAudioJitterBufferMaxDelay) {
-          return std::chrono::milliseconds(1);
-        }
-        state.audio_jitter_buffering = false;
-        state.next_haptics_send_time = now;
-      }
-
-      if (state.next_haptics_send_time != Clock::time_point{} &&
-          now < state.next_haptics_send_time) {
-        const auto remaining = state.next_haptics_send_time - now;
-        return std::max<Clock::duration>(
-            kAudioFlushMinimumSleep,
-            std::min<Clock::duration>(kAudioFlushIdleSleep, remaining));
-      }
-
-      while (state.pending_audio_chunks.size() > kAudioFreshQueueChunks) {
-        state.pending_audio_chunks.pop_front();
-        ++state.audio_dropped_count;
-        ++state.audio_stale_dropped_count;
-        ++stale_dropped_now;
-      }
-      const vds::AudioChunk chunk = state.pending_audio_chunks.front();
-      has_signal = chunk.has_signal;
-      has_haptics_signal = chunk.has_haptics_signal;
-      vds::HapticsChunk haptics = chunk.haptics;
-      for (std::int8_t &sample : haptics) {
-        const auto limited = static_cast<std::int8_t>(std::clamp<int>(
-            sample, kWindowsHapticsSampleMin, kWindowsHapticsSampleMax));
-        haptics_limited = haptics_limited || limited != sample;
-        sample = limited;
-      }
-      const bool route_headset = state.waveout_active
-                                     ? !state.waveout_speaker_selected
-                                     : state.headset_plugged;
-      packet = state.haptics_builder.build_packet(haptics, chunk.speaker,
-                                                  state.output_state.state(),
-                                                  true, route_headset);
-      sent_audio_chunk = chunk;
-      have_sent_audio_chunk = true;
-      scheduled_send_time = state.next_haptics_send_time == Clock::time_point{}
-                                ? now
-                                : state.next_haptics_send_time;
-      send_time = now;
-      stale_dropped_count = state.audio_stale_dropped_count;
+      logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,
+                 "turn off: no Bluetooth radio knew address=" + address);
     }
+  } catch (const std::exception &error) {
+    logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,
+               "turn off failed address=" + address + " error=" +
+                   error.what());
   }
+}
 
-  if (audio_route_deactivated) {
-    if (stream_stop_report) {
-      (void)try_send_bt_output_report(bluetooth, *stream_stop_report, logger,
-                                      bluetooth_mutex, "state");
-    }
-    logger.log(vds::LogScope::Output, vds::LogLevel::Info,
-               "audio out stream auto-deactivated after PCM drain");
-    return next_sleep;
-  }
-
-  const auto write_start = Clock::now();
-  const bool sent = try_send_bt_output_report(bluetooth, packet, logger,
-                                              bluetooth_mutex, "audio");
-  const auto write_duration = Clock::now() - write_start;
-  if (!sent) {
-    std::size_t pending_count = 0;
+void virtual_to_bluetooth_loop(HANDLE virtual_device, BridgeSession &session,
+                               WinBridgeUsb &usb, vds::Logger &logger,
+                               const std::atomic_uint32_t *trace_flags,
+                               std::atomic_bool &bridge_restart_requested) {
+  while (!g_stop_requested.load() && !bridge_restart_requested.load()) {
+    const Frame frame = vds::win::read_handle_frame(
+        virtual_device, "virtual", handle_io_cancellation());
     {
-      std::lock_guard guard(state.mutex);
-      if (!sending_keepalive && !sending_concealment &&
-          !state.pending_audio_chunks.empty()) {
-        state.pending_audio_chunks.pop_front();
-      }
-      if (sending_keepalive) {
-        ++state.audio_keepalive_blocked_count;
-      } else {
-        ++state.audio_blocked_count;
-        if (!sending_concealment) {
-          ++state.audio_dropped_count;
-        }
-      }
-      blocked_count = state.audio_blocked_count;
-      dropped_count = state.audio_dropped_count;
-      pending_count = state.pending_audio_chunks.size();
-      if (!sending_keepalive) {
-        send_interval = audio_output_interval_for_pending(
-            pending_count, low_watermark_paced, high_watermark_catchup);
-        if (low_watermark_paced) {
-          ++state.audio_low_watermark_pace_count;
-        }
-      }
-      state.next_haptics_send_time = scheduled_send_time + send_interval;
-      if (state.next_haptics_send_time <= send_time) {
-        state.next_haptics_send_time = send_time + send_interval;
-      }
-      stale_dropped_count = state.audio_stale_dropped_count;
+      std::lock_guard lock(g_bridge_mutex);
+      vds::bridge_handle_usb_frame(session.port, frame.header.type,
+                                   frame.payload, session.bt, usb,
+                                   load_trace_flags(trace_flags), logger);
     }
-    if (blocked_count == 1 || (blocked_count % 1000) == 0) {
-      logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
-                 "dropped BT 0x36 audio packet after HID queue blocked count=" +
-                     std::to_string(blocked_count) +
-                     " pending=" + std::to_string(pending_count) +
-                     " dropped=" + std::to_string(dropped_count) +
-                     " stale_dropped=" + std::to_string(stale_dropped_count));
-    }
-    return Clock::duration::zero();
-  }
-
-  {
-    std::lock_guard guard(state.mutex);
-    if (!sending_keepalive && !sending_concealment &&
-        !state.pending_audio_chunks.empty()) {
-      state.pending_audio_chunks.pop_front();
-    }
-    pending_after_pop = state.pending_audio_chunks.size();
-    if (pending_after_pop == 0) {
-      state.audio_jitter_buffer_start = {};
-    }
-    state.last_sent_state = state.output_state.state();
-    state.have_last_sent_state = true;
-    if (sending_keepalive) {
-      ++state.audio_keepalive_sent_count;
-      keepalive_sent_count = state.audio_keepalive_sent_count;
-    } else if (sending_concealment) {
-      ++state.audio_concealed_count;
-      concealed_count = state.audio_concealed_count;
-    } else {
-      ++state.audio_sent_count;
-      if (have_sent_audio_chunk) {
-        state.last_audio_chunk = sent_audio_chunk;
-      }
-      if (has_haptics_signal && !state.audio_haptics_sent_seen) {
-        state.audio_haptics_sent_seen = true;
-        haptics_sent_first_seen = true;
-      }
-    }
-    sent_count = state.audio_sent_count;
-    dropped_count = state.audio_dropped_count;
-    stale_dropped_count = state.audio_stale_dropped_count;
-    blocked_count = state.audio_blocked_count;
-    if (state.have_last_audio_send_time) {
-      have_gap = true;
-      send_gap = send_time - state.last_audio_send_time;
-      state.audio_send_max_gap = std::max(state.audio_send_max_gap, send_gap);
-      if (send_gap >= kAudioSendGapWarn) {
-        ++state.audio_send_gap_warn_count;
-      }
-    }
-    state.last_audio_send_time = send_time;
-    state.have_last_audio_send_time = true;
-    if (scheduled_send_time != Clock::time_point{} &&
-        send_time > scheduled_send_time) {
-      have_schedule_late = true;
-      schedule_late = send_time - scheduled_send_time;
-    }
-    if (!sending_keepalive && !sending_concealment) {
-      send_interval = audio_output_interval_for_pending(
-          pending_after_pop, low_watermark_paced, high_watermark_catchup);
-      if (low_watermark_paced) {
-        ++state.audio_low_watermark_pace_count;
-      }
-    }
-    state.next_haptics_send_time = scheduled_send_time + send_interval;
-    if (state.next_haptics_send_time <= send_time) {
-      state.next_haptics_send_time = send_time + send_interval;
-      schedule_reset = true;
-    }
-    if (state.next_haptics_send_time > send_time) {
-      next_sleep = state.next_haptics_send_time - send_time;
-    }
-  }
-
-  if (stale_dropped_now > 0 || (have_gap && send_gap >= kAudioSendGapWarn) ||
-      write_duration >= kAudioWriteSlowWarn ||
-      schedule_late >= kAudioWriteSlowWarn || sent_count == 1 ||
-      haptics_sent_first_seen) {
-    const bool delayed_send = stale_dropped_now > 0 ||
-                              (have_gap && send_gap >= kAudioSendGapWarn) ||
-                              write_duration >= kAudioWriteSlowWarn ||
-                              schedule_late >= kAudioWriteSlowWarn;
-    std::string message =
-        std::string(sending_keepalive
-                        ? "audio keepalive sent count="
-                        : (sending_concealment ? "audio concealment sent count="
-                                               : "audio sent count=")) +
-        std::to_string(
-            sending_keepalive
-                ? keepalive_sent_count
-                : (sending_concealment ? concealed_count : sent_count)) +
-        " pending=" + std::to_string(pending_after_pop) +
-        " dropped=" + std::to_string(dropped_count) +
-        " stale_dropped_now=" + std::to_string(stale_dropped_now) +
-        " stale_dropped=" + std::to_string(stale_dropped_count) +
-        " blocked=" + std::to_string(blocked_count) +
-        " write_us=" + std::to_string(duration_us(write_duration)) +
-        " interval_us=" + std::to_string(duration_us(send_interval)) +
-        " next_us=" + std::to_string(duration_us(next_sleep)) +
-        " has_signal=" + (has_signal ? "yes" : "no") +
-        " has_haptics=" + (has_haptics_signal ? "yes" : "no");
-    if (have_schedule_late) {
-      message += " due_late_us=" + std::to_string(duration_us(schedule_late));
-    }
-    if (schedule_reset) {
-      message += " schedule_reset=yes";
-    }
-    if (haptics_limited) {
-      message += " haptics_limited=yes";
-    }
-    if (low_watermark_paced) {
-      message += " low_watermark_pace=yes";
-    }
-    if (high_watermark_catchup) {
-      message += " high_watermark_catchup=yes";
-    }
-    if (have_gap) {
-      message += " gap_us=" + std::to_string(duration_us(send_gap));
-    }
-    logger.log(vds::LogScope::Output,
-               delayed_send ? vds::LogLevel::Warn : vds::LogLevel::Info,
-               message);
-  }
-  return Clock::duration::zero();
-}
-
-void maybe_log_audio_summary(BluetoothTransport &bluetooth, BridgeState &state,
-                             vds::Logger &logger) {
-  std::string message;
-  bool warn = false;
-  {
-    std::lock_guard guard(state.mutex);
-    const bool have_audio_activity = state.audio_out_stream_active ||
-                                     state.audio_pcm_stream_active ||
-                                     !state.pending_audio_chunks.empty();
-    if (!have_audio_activity) {
-      return;
-    }
-
-    const auto now = Clock::now();
-    if (state.audio_last_summary_time != Clock::time_point{} &&
-        now - state.audio_last_summary_time < kAudioSummaryInterval) {
-      return;
-    }
-
-    const auto interval = state.audio_last_summary_time == Clock::time_point{}
-                              ? Clock::duration{}
-                              : now - state.audio_last_summary_time;
-    const std::uint64_t usb_delta =
-        state.audio_usb_frame_count - state.audio_last_summary_usb_frame_count;
-    const std::uint64_t sent_delta =
-        state.audio_sent_count - state.audio_last_summary_sent_count;
-    const std::uint64_t concealed_delta =
-        state.audio_concealed_count - state.audio_last_summary_concealed_count;
-    const std::uint64_t keepalive_delta =
-        state.audio_keepalive_sent_count -
-        state.audio_last_summary_keepalive_sent_count;
-    const std::uint64_t dropped_delta =
-        state.audio_dropped_count - state.audio_last_summary_dropped_count;
-    const std::uint64_t blocked_delta =
-        state.audio_blocked_count - state.audio_last_summary_blocked_count;
-    const std::uint64_t underflow_delta =
-        state.audio_underflow_count - state.audio_last_summary_underflow_count;
-    const std::uint64_t usb_gap_warn_delta =
-        state.audio_usb_gap_warn_count -
-        state.audio_last_summary_usb_gap_warn_count;
-    const std::uint64_t send_gap_warn_delta =
-        state.audio_send_gap_warn_count -
-        state.audio_last_summary_send_gap_warn_count;
-    const std::uint64_t flush_gap_warn_delta =
-        state.audio_flush_gap_warn_count -
-        state.audio_last_summary_flush_gap_warn_count;
-    const std::uint64_t low_watermark_pace_delta =
-        state.audio_low_watermark_pace_count -
-        state.audio_last_summary_low_watermark_pace_count;
-
-    warn = dropped_delta != 0 || blocked_delta != 0 || underflow_delta != 0 ||
-           usb_gap_warn_delta != 0 || send_gap_warn_delta != 0 ||
-           flush_gap_warn_delta != 0;
-    message =
-        "audio summary interval_us=" + std::to_string(duration_us(interval)) +
-        " active=" + (state.audio_out_stream_active ? "yes" : "no") +
-        " pcm_active=" + (state.audio_pcm_stream_active ? "yes" : "no") +
-        " pending=" + std::to_string(state.pending_audio_chunks.size()) +
-        " usb_frames=" + std::to_string(state.audio_usb_frame_count) +
-        " usb_delta=" + std::to_string(usb_delta) +
-        " sent=" + std::to_string(state.audio_sent_count) +
-        " sent_delta=" + std::to_string(sent_delta) +
-        " concealed=" + std::to_string(state.audio_concealed_count) +
-        " concealed_delta=" + std::to_string(concealed_delta) +
-        " keepalive=" + std::to_string(state.audio_keepalive_sent_count) +
-        " keepalive_delta=" + std::to_string(keepalive_delta) +
-        " dropped=" + std::to_string(state.audio_dropped_count) +
-        " dropped_delta=" + std::to_string(dropped_delta) +
-        " stale_dropped=" + std::to_string(state.audio_stale_dropped_count) +
-        " blocked=" + std::to_string(state.audio_blocked_count) +
-        " blocked_delta=" + std::to_string(blocked_delta) +
-        " underflow=" + std::to_string(state.audio_underflow_count) +
-        " underflow_delta=" + std::to_string(underflow_delta) +
-        " usb_max_gap_us=" +
-        std::to_string(duration_us(state.audio_usb_max_gap)) +
-        " send_max_gap_us=" +
-        std::to_string(duration_us(state.audio_send_max_gap)) +
-        " flush_max_gap_us=" +
-        std::to_string(duration_us(state.audio_flush_max_gap)) +
-        " gap_warn_delta_usb=" + std::to_string(usb_gap_warn_delta) +
-        " gap_warn_delta_send=" + std::to_string(send_gap_warn_delta) +
-        " gap_warn_delta_flush=" + std::to_string(flush_gap_warn_delta) +
-        " low_watermark_pace=" +
-        std::to_string(state.audio_low_watermark_pace_count) +
-        " low_watermark_pace_delta=" + std::to_string(low_watermark_pace_delta);
-
-    state.audio_last_summary_time = now;
-    state.audio_last_summary_usb_frame_count = state.audio_usb_frame_count;
-    state.audio_last_summary_sent_count = state.audio_sent_count;
-    state.audio_last_summary_concealed_count = state.audio_concealed_count;
-    state.audio_last_summary_keepalive_sent_count =
-        state.audio_keepalive_sent_count;
-    state.audio_last_summary_dropped_count = state.audio_dropped_count;
-    state.audio_last_summary_blocked_count = state.audio_blocked_count;
-    state.audio_last_summary_underflow_count = state.audio_underflow_count;
-    state.audio_last_summary_usb_gap_warn_count =
-        state.audio_usb_gap_warn_count;
-    state.audio_last_summary_send_gap_warn_count =
-        state.audio_send_gap_warn_count;
-    state.audio_last_summary_flush_gap_warn_count =
-        state.audio_flush_gap_warn_count;
-    state.audio_last_summary_low_watermark_pace_count =
-        state.audio_low_watermark_pace_count;
-  }
-
-  logger.log(vds::LogScope::Output,
-             warn ? vds::LogLevel::Warn : vds::LogLevel::Info, message);
-  if (auto diagnostics = bluetooth.take_output_diagnostics(true)) {
-    logger.log(vds::LogScope::Output,
-               warn ? vds::LogLevel::Warn : vds::LogLevel::Info, *diagnostics);
+    SetEvent(session.audio_wake);
   }
 }
 
-void audio_flush_loop(BluetoothTransport &bluetooth, BridgeState &state,
-                      vds::Logger &logger, std::mutex &bluetooth_mutex,
-                      std::atomic_bool &bridge_restart_requested) {
+void bluetooth_to_virtual_loop(BluetoothTransport &bluetooth,
+                               BridgeSession &session, WinBridgeUsb &usb,
+                               vds::Logger &logger,
+                               const std::atomic_uint32_t *trace_flags,
+                               std::atomic_bool &bridge_restart_requested) {
+  while (!g_stop_requested.load() && !bridge_restart_requested.load()) {
+    const Frame frame = bluetooth.read_frame();
+    const auto read_time = Clock::now();
+    if (frame.header.type == VDS_FRAME_BT_INTERRUPT_PACKET) {
+      vds::BridgeInputResult result;
+      {
+        std::lock_guard lock(g_bridge_mutex);
+        result = vds::bridge_handle_bt_input(
+            session.port, frame.payload, read_time, *session.bt, usb,
+            g_companion, load_trace_flags(trace_flags), logger);
+      }
+      SetEvent(session.audio_wake);
+      if (result.idle_timeout) {
+        power_off_controller(session.address, "idle", logger);
+      }
+    } else if (frame.header.type == VDS_FRAME_BT_CONTROL_PACKET) {
+      if (const auto report = bt_feature_to_usb_feature_reply(frame.payload)) {
+        std::lock_guard lock(g_bridge_mutex);
+        vds::bridge_handle_feature_reply(session.port, *report, usb,
+                                         load_trace_flags(trace_flags), logger);
+      }
+    }
+  }
+}
+
+// Sends the paced audio/haptics packets, deferred state reports and mic open
+// retries, sleeping on a high-resolution timer until the next one is due or
+// the other threads queue something.
+void audio_loop(BridgeSession &session, vds::Logger &logger,
+                const std::atomic_uint32_t *trace_flags,
+                std::atomic_bool &bridge_restart_requested) {
   AudioThreadPriorityGuard priority_guard;
   logger.log(vds::LogScope::Output,
              priority_guard.boosted() ? vds::LogLevel::Info
                                       : vds::LogLevel::Warn,
              priority_guard.summary());
-  HighResolutionSleeper sleeper;
-  logger.log(vds::LogScope::Output,
-             sleeper.active() ? vds::LogLevel::Info : vds::LogLevel::Warn,
-             std::string("high resolution audio flush timer ") +
-                 (sleeper.active() ? "enabled" : "unavailable"));
+  UniqueHandle timer(CreateWaitableTimerExA(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+      TIMER_MODIFY_STATE | SYNCHRONIZE));
+  if (!timer) {
+    timer.reset(CreateWaitableTimerExA(nullptr, nullptr, 0,
+                                       TIMER_MODIFY_STATE | SYNCHRONIZE));
+  }
+  if (!timer) {
+    throw std::runtime_error("failed to create audio timer: " +
+                             win32_error_message(GetLastError()));
+  }
+
   while (!g_stop_requested.load() && !bridge_restart_requested.load()) {
+    std::optional<Clock::time_point> wake;
     {
-      std::lock_guard guard(state.mutex);
-      const auto now = Clock::now();
-      if (state.audio_last_flush_time != Clock::time_point{}) {
-        const auto flush_gap = now - state.audio_last_flush_time;
-        state.audio_flush_max_gap =
-            std::max(state.audio_flush_max_gap, flush_gap);
-        if (flush_gap >= kAudioSendGapWarn) {
-          ++state.audio_flush_gap_warn_count;
-        }
+      std::lock_guard lock(g_bridge_mutex);
+      const std::uint32_t flags = load_trace_flags(trace_flags);
+      vds::BridgePort &port = session.port;
+      vds::bridge_retry_mic_open(port, *session.bt, logger);
+      vds::bridge_enqueue_waveout(port, flags, logger);
+      if (vds::bridge_flush_pending_state(port, *session.bt, flags, logger)) {
+        (void)vds::bridge_flush_audio(port, *session.bt, flags, logger);
       }
-      state.audio_last_flush_time = now;
+      wake = vds::bridge_next_wakeup(port, Clock::now());
     }
-    enqueue_waveout_chunk(state);
-    const auto sleep_duration =
-        flush_pending_audio_chunk(bluetooth, state, logger, bluetooth_mutex);
-    maybe_log_audio_summary(bluetooth, state, logger);
-    sleeper.sleep_for(sleep_duration);
-  }
-}
 
-void virtual_to_bluetooth_loop(HANDLE virtual_device,
-                               BluetoothTransport &bluetooth,
-                               BridgeState &state, vds::Logger &logger,
-                               std::mutex &bluetooth_mutex,
-                               std::atomic_bool &bridge_restart_requested) {
-  while (!g_stop_requested.load() && !bridge_restart_requested.load()) {
-    handle_virtual_frame(virtual_device, bluetooth, state,
-                         vds::win::read_handle_frame(virtual_device, "virtual",
-                                                     handle_io_cancellation()),
-                         logger, bluetooth_mutex, bridge_restart_requested);
-  }
-}
-
-void bluetooth_to_virtual_loop(BluetoothTransport &bluetooth,
-                               HANDLE virtual_device, BridgeState &state,
-                               vds::Logger &logger,
-                               std::atomic_bool &bridge_restart_requested,
-                               const std::atomic_uint32_t *trace_flags,
-                               std::mutex &bluetooth_mutex) {
-  while (!g_stop_requested.load() && !bridge_restart_requested.load()) {
-    handle_bluetooth_frame(
-        virtual_device, bluetooth, state, bluetooth.read_frame(), logger,
-        trace_flags == nullptr ? 0 : trace_flags->load(), bluetooth_mutex);
+    std::vector<HANDLE> handles{session.audio_wake};
+    if (g_stop_event != nullptr) {
+      handles.push_back(g_stop_event);
+    }
+    if (wake) {
+      const auto delay = *wake - Clock::now();
+      if (delay <= Clock::duration::zero()) {
+        continue;
+      }
+      using HundredNanoseconds =
+          std::chrono::duration<long long, std::ratio<1, 10000000>>;
+      LARGE_INTEGER due_time{};
+      due_time.QuadPart = -std::max<long long>(
+          1, std::chrono::duration_cast<HundredNanoseconds>(delay).count());
+      if (SetWaitableTimerEx(timer.get(), &due_time, 0, nullptr, nullptr,
+                             nullptr, 0)) {
+        handles.push_back(timer.get());
+      } else {
+        std::this_thread::sleep_for(delay);
+        continue;
+      }
+    }
+    WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(),
+                           FALSE, INFINITE);
   }
 }
 
@@ -2057,6 +689,14 @@ void run_bridge_session(const std::string &device_address,
     throw std::runtime_error("failed to open Bluetooth controller: " +
                              discovery_error);
   }
+  {
+    std::lock_guard lock(g_bridge_mutex);
+    if (vds::bridge_settings().host_persona != vds::HostPersona::DualSense) {
+      logger.log(vds::LogScope::Companion, vds::LogLevel::Warn,
+                 "DualShock 4 and Xbox 360 personas are not available on "
+                 "Windows yet; bridging as a DualSense");
+    }
+  }
   std::unique_ptr<vds::win::hidhide::DeviceGuard> hidden_device =
       vds::win::hidhide::hide_device(device->instance_path, logger);
   std::unique_ptr<BluetoothTransport> bluetooth =
@@ -2064,11 +704,23 @@ void run_bridge_session(const std::string &device_address,
   std::unique_ptr<vds::win::usbip::VirtualPort> virtual_port =
       vds::win::usbip::open_virtual_port(profile, selected_config->ports[0],
                                          logger);
-  BridgeState state;
   std::mutex bluetooth_mutex;
   UniqueHandle virtual_device_handle = open_device(virtual_port->pipe_path());
+  UniqueHandle audio_wake(CreateEventA(nullptr, FALSE, FALSE, nullptr));
+  if (!audio_wake) {
+    throw std::runtime_error("failed to create audio wake event: " +
+                             win32_error_message(GetLastError()));
+  }
   std::atomic_bool bridge_restart_requested = false;
   std::thread stop_monitor;
+
+  WinBridgeBluetooth bt(*bluetooth, bluetooth_mutex, logger);
+  WinBridgeUsb usb(virtual_device_handle.get());
+  BridgeSession session;
+  session.port.path = virtual_device;
+  session.address = vds::normalize_bluetooth_address(selected_config->address);
+  session.bt = &bt;
+  session.audio_wake = audio_wake.get();
 
   if (session_stop_requested != nullptr) {
     stop_monitor = std::thread([&] {
@@ -2078,7 +730,7 @@ void run_bridge_session(const std::string &device_address,
       }
       if (g_stop_requested.load() || session_stop_requested->load()) {
         request_bridge_restart(virtual_device_handle.get(), bluetooth.get(),
-                               bridge_restart_requested);
+                               audio_wake.get(), bridge_restart_requested);
       }
     });
   }
@@ -2090,7 +742,17 @@ void run_bridge_session(const std::string &device_address,
   };
 
   try {
-    send_initial_bluetooth_reports(*bluetooth, state, logger, bluetooth_mutex);
+    // Prime the feature cache (calibration, firmware, MAC) for the host.
+    for (const std::uint8_t report_id : kInitialFeatureReportIds) {
+      if (const auto report = bt.get_feature_report(report_id)) {
+        vds::bridge_store_feature_report(session.port, *report);
+      }
+    }
+    logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
+               "sending Windows startup Bluetooth output init report");
+    bluetooth->write_interrupt_packet(
+        hidp_output_packet(session.port.output_state.build_bt_init_report()));
+    session.port.last_sent_bt_state = session.port.output_state.state();
   } catch (...) {
     stop_startup_monitors();
     throw;
@@ -2100,64 +762,123 @@ void run_bridge_session(const std::string &device_address,
     throw std::runtime_error("Bluetooth transport disconnected during startup");
   }
 
+  // Companion settings (and the mic, when it is on) apply right away.
+  {
+    std::lock_guard lock(g_bridge_mutex);
+    g_sessions.push_back(&session);
+    const vds::DsCompanionOverrides overrides =
+        vds::bridge_companion_overrides(g_companion);
+    vds::bridge_apply_companion(session.port, g_companion.settings, overrides,
+                                bt, load_trace_flags(trace_flags), logger);
+  }
+
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
              "Windows bridge started virtual=" + virtual_device +
                  " bluetooth=" + bluetooth->description());
 
-  std::thread to_bluetooth([&] {
-    try {
-      virtual_to_bluetooth_loop(virtual_device_handle.get(), *bluetooth, state,
-                                logger, bluetooth_mutex,
-                                bridge_restart_requested);
-    } catch (const std::exception &error) {
-      if (!g_stop_requested) {
-        logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
-                   std::string("virtual-to-bluetooth stopped: ") +
-                       error.what());
-        request_bridge_restart(virtual_device_handle.get(), bluetooth.get(),
-                               bridge_restart_requested);
+  const auto run_thread = [&](const char *name, auto &&body) {
+    return std::thread([&, name, body] {
+      try {
+        body();
+      } catch (const std::exception &error) {
+        if (!g_stop_requested) {
+          logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
+                     std::string(name) + " stopped: " + error.what());
+        }
       }
-    }
+      request_bridge_restart(virtual_device_handle.get(), bluetooth.get(),
+                             audio_wake.get(), bridge_restart_requested);
+    });
+  };
+  std::thread to_bluetooth = run_thread("virtual-to-bluetooth", [&] {
+    virtual_to_bluetooth_loop(virtual_device_handle.get(), session, usb,
+                              logger, trace_flags, bridge_restart_requested);
   });
-
-  std::thread to_virtual([&] {
-    try {
-      bluetooth_to_virtual_loop(*bluetooth, virtual_device_handle.get(), state,
-                                logger, bridge_restart_requested, trace_flags,
-                                bluetooth_mutex);
-    } catch (const std::exception &error) {
-      if (!g_stop_requested) {
-        logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
-                   std::string("bluetooth-to-virtual stopped: ") +
-                       error.what());
-        request_bridge_restart(virtual_device_handle.get(), bluetooth.get(),
-                               bridge_restart_requested);
-      }
-    }
+  std::thread to_virtual = run_thread("bluetooth-to-virtual", [&] {
+    bluetooth_to_virtual_loop(*bluetooth, session, usb, logger, trace_flags,
+                              bridge_restart_requested);
   });
-
-  std::thread audio_flush([&] {
-    try {
-      audio_flush_loop(*bluetooth, state, logger, bluetooth_mutex,
-                       bridge_restart_requested);
-    } catch (const std::exception &error) {
-      if (!g_stop_requested) {
-        logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
-                   std::string("audio flush stopped: ") + error.what());
-        request_bridge_restart(virtual_device_handle.get(), bluetooth.get(),
-                               bridge_restart_requested);
-      }
-    }
+  std::thread audio = run_thread("audio", [&] {
+    audio_loop(session, logger, trace_flags, bridge_restart_requested);
   });
 
   to_bluetooth.join();
   to_virtual.join();
-  audio_flush.join();
+  audio.join();
   bridge_restart_requested = true;
   if (stop_monitor.joinable()) {
     stop_monitor.join();
   }
+  {
+    std::lock_guard lock(g_bridge_mutex);
+    std::erase(g_sessions, &session);
+    vds::bridge_on_disconnect(session.port);
+  }
 }
+
+// Applies the companion runtime (settings, momentary effects, Turn Off) to
+// every connected controller.
+void apply_companion_state(std::uint32_t trace_flags, vds::Logger &logger) {
+  std::vector<std::string> power_off;
+  {
+    std::lock_guard lock(g_bridge_mutex);
+    (void)vds::expire_companion_actuation(g_companion, Clock::now());
+    if (g_companion.actuation.power_off_pending) {
+      g_companion.actuation.power_off_pending = false;
+      for (const BridgeSession *session : g_sessions) {
+        power_off.push_back(session->address);
+      }
+    }
+    const vds::DsCompanionOverrides overrides =
+        vds::bridge_companion_overrides(g_companion);
+    for (BridgeSession *session : g_sessions) {
+      vds::bridge_apply_companion(session->port, g_companion.settings,
+                                  overrides, *session->bt, trace_flags, logger);
+      SetEvent(session->audio_wake);
+    }
+  }
+  for (const std::string &address : power_off) {
+    power_off_controller(address, "turned off from the companion app", logger);
+  }
+}
+
+// Mic and headset state of the first connected controller, for the companion
+// AUDIO_STATUS report. Caller holds g_bridge_mutex.
+void publish_companion_audio_status() {
+  g_companion.audio_status = g_sessions.empty()
+                                 ? vds::CompanionAudioStatus{}
+                                 : vds::bridge_audio_status(g_sessions.front()->port);
+}
+
+std::string handle_audio_stats_request() {
+  const auto now = Clock::now();
+  std::string reply = "{";
+  reply += vds::jsonl_bool_field("OK", true);
+  reply += ',';
+  reply += vds::jsonl_string_field("error", "");
+  reply += ",\"ports\":[";
+  std::lock_guard lock(g_bridge_mutex);
+  bool first = true;
+  for (BridgeSession *session : g_sessions) {
+    if (!first) {
+      reply += ',';
+    }
+    first = false;
+    reply += vds::bridge_audio_stats_json(session->port, now);
+  }
+  reply += "]}\n";
+  return reply;
+}
+
+std::string control_error_reply(std::string_view error) {
+  std::string reply = "{";
+  reply += vds::jsonl_bool_field("OK", false);
+  reply += ',';
+  reply += vds::jsonl_string_field("error", std::string(error));
+  reply += "}\n";
+  return reply;
+}
+
 
 struct BridgeWorker {
   std::string address;
@@ -2169,6 +890,38 @@ struct BridgeWorker {
   std::thread thread;
   std::atomic_bool stop_requested = false;
   std::atomic_bool done = false;
+};
+
+// The control pipe's security: vdsd runs as a service, and the companion
+// app (a normal user) must be able to talk to it, like the vds group's
+// access to /run/vdsd.sock on Linux. SYSTEM and Administrators get full
+// control, signed-in users read/write.
+class PipeSecurity {
+public:
+  PipeSecurity() {
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)", SDDL_REVISION_1,
+            &descriptor_, nullptr)) {
+      attributes_.nLength = sizeof(attributes_);
+      attributes_.lpSecurityDescriptor = descriptor_;
+      attributes_.bInheritHandle = FALSE;
+    }
+  }
+  ~PipeSecurity() {
+    if (descriptor_ != nullptr) {
+      LocalFree(descriptor_);
+    }
+  }
+  PipeSecurity(const PipeSecurity &) = delete;
+  PipeSecurity &operator=(const PipeSecurity &) = delete;
+
+  SECURITY_ATTRIBUTES *attributes() {
+    return descriptor_ != nullptr ? &attributes_ : nullptr;
+  }
+
+private:
+  PSECURITY_DESCRIPTOR descriptor_ = nullptr;
+  SECURITY_ATTRIBUTES attributes_{};
 };
 
 class ControlPipeServer {
@@ -2287,8 +1040,8 @@ private:
     while (!stop_requested_) {
       UniqueHandle pipe(CreateNamedPipeA(
           pipe_name_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-          PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 4096, 4096,
-          0, nullptr));
+          PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 65536,
+          65536, 0, security_.attributes()));
       if (!pipe) {
         logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
                     "failed to create control pipe " + pipe_name_ + ": " +
@@ -2329,6 +1082,10 @@ private:
     }
     if (!GetOverlappedResult(pipe, &overlapped, &bytes_transferred, FALSE)) {
       const DWORD error = GetLastError();
+      if (error == ERROR_MORE_DATA) {
+        SetLastError(ERROR_MORE_DATA);
+        return false;
+      }
       if (!stop_requested_ && error != ERROR_NO_DATA &&
           error != ERROR_BROKEN_PIPE) {
         logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
@@ -2372,6 +1129,8 @@ private:
     return wait_for_pipe_io(pipe, overlapped, ignored, "control pipe connect");
   }
 
+  // Reads one request; message-mode pipes hand long ones over in pieces
+  // (ERROR_MORE_DATA).
   std::optional<std::string> read_command(HANDLE pipe) {
     UniqueHandle event(CreateEventA(nullptr, TRUE, FALSE, nullptr));
     if (!event) {
@@ -2381,32 +1140,48 @@ private:
       return std::nullopt;
     }
 
-    std::array<char, 512> buffer{};
-    DWORD got = 0;
-    OVERLAPPED overlapped{};
-    overlapped.hEvent = event.get();
-    const BOOL started =
-        ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size() - 1),
-                 &got, &overlapped);
-    if (!started) {
-      const DWORD error = GetLastError();
-      if (error != ERROR_IO_PENDING) {
-        if (!stop_requested_ && error != ERROR_NO_DATA &&
-            error != ERROR_BROKEN_PIPE) {
-          logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
-                      "control pipe read failed: " +
-                          win32_error_message(error));
+    std::string command;
+    std::array<char, 4096> buffer{};
+    while (command.size() < kMaxControlRequest) {
+      DWORD got = 0;
+      OVERLAPPED overlapped{};
+      overlapped.hEvent = event.get();
+      ResetEvent(event.get());
+      bool more = false;
+      if (!ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()),
+                    &got, &overlapped)) {
+        DWORD error = GetLastError();
+        if (error == ERROR_IO_PENDING) {
+          if (!wait_for_pipe_io(pipe, overlapped, got, "control pipe read")) {
+            if (GetLastError() != ERROR_MORE_DATA) {
+              return std::nullopt;
+            }
+            error = ERROR_MORE_DATA;
+          } else {
+            error = ERROR_SUCCESS;
+          }
         }
-        return std::nullopt;
+        if (error == ERROR_MORE_DATA) {
+          more = true;
+        } else if (error != ERROR_SUCCESS) {
+          if (!stop_requested_ && error != ERROR_NO_DATA &&
+              error != ERROR_BROKEN_PIPE) {
+            logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
+                        "control pipe read failed: " +
+                            win32_error_message(error));
+          }
+          return std::nullopt;
+        }
       }
-      if (!wait_for_pipe_io(pipe, overlapped, got, "control pipe read")) {
-        return std::nullopt;
+      command.append(buffer.data(), static_cast<std::size_t>(got));
+      if (!more) {
+        break;
       }
     }
-    if (got == 0) {
+    if (command.empty()) {
       return std::nullopt;
     }
-    return std::string(buffer.data(), static_cast<std::size_t>(got));
+    return command;
   }
 
   bool write_reply(HANDLE pipe, const std::string &reply) {
@@ -2452,6 +1227,7 @@ private:
   }
 
   vds::Logger &logger_;
+  PipeSecurity security_;
   std::string pipe_name_;
   UniqueHandle stop_event_;
   UniqueHandle command_event_;
@@ -2468,8 +1244,23 @@ bool worker_is_connected(const BridgeWorker &worker) {
 std::string handle_supervisor_control_command(
     const std::string &command,
     const std::vector<std::unique_ptr<BridgeWorker>> &workers,
-    const std::string &db_path, std::uint32_t &trace_flags,
-    bool &reload_requested, vds::Logger &logger) {
+    const std::string &db_path, const std::string &log_path,
+    std::uint32_t &trace_flags, bool &reload_requested, vds::Logger &logger) {
+  std::vector<vds::JsonlField> fields;
+  const std::optional<std::string> local_command =
+      vds::parse_control_command_name(command, fields);
+  if (local_command == "audio") {
+    return handle_audio_stats_request();
+  }
+  if (local_command == "log") {
+    return vds::handle_daemon_log_request(fields, log_path, trace_flags,
+                                          logger);
+  }
+  if (local_command == "bluetooth") {
+    return control_error_reply(
+        "Bluetooth modes are not available on Windows");
+  }
+
   std::vector<vds::VdsdControlControllerStatus> controller_statuses;
   controller_statuses.reserve(workers.size());
   for (const auto &worker : workers) {
@@ -2507,12 +1298,17 @@ std::string handle_supervisor_control_command(
   const std::vector<vds::VdsdControlPortStatus> port_statuses =
       vds::build_vdsd_control_port_statuses(port_candidates, port_bindings);
 
-  // Companion protocol state persists for the daemon lifetime.
-  static vds::CompanionRuntime companion;
+  // Companion requests touch the runtime the sessions read; the others may
+  // be slow (target discovery) and must not stall the audio threads.
+  std::unique_lock<std::mutex> bridge_lock;
+  if (local_command == "companion") {
+    bridge_lock = std::unique_lock<std::mutex>(g_bridge_mutex);
+    publish_companion_audio_status();
+  }
   return vds::handle_vdsd_control_command(
       command, db_path, controller_statuses, port_statuses,
       [] { return list_windows_controller_targets(); }, trace_flags,
-      reload_requested, companion, logger);
+      reload_requested, g_companion, logger);
 }
 
 void run_configured_bridge_worker(vds::ControllerConfig config,
@@ -2548,6 +1344,7 @@ void run_configured_bridge_worker(vds::ControllerConfig config,
 }
 
 void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
+  std::uint64_t applied_companion_version = 0;
   std::vector<std::unique_ptr<BridgeWorker>> workers;
   std::vector<vds::VdsdWorkerFailureBackoff> worker_failure_backoffs;
   std::vector<std::string> discovery_warned_states;
@@ -2836,6 +1633,21 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
       }
     }
 
+    // Momentary companion effects (rumble/trigger tests) end on a deadline.
+    std::optional<Clock::time_point> companion_deadline;
+    {
+      std::lock_guard lock(g_bridge_mutex);
+      companion_deadline = vds::next_companion_actuation_deadline(g_companion);
+    }
+    if (companion_deadline) {
+      if (*companion_deadline <= now) {
+        apply_companion_state(trace_flags.load(), logger);
+        continue;
+      }
+      retry_after = retry_after ? std::min(*retry_after, *companion_deadline)
+                                : companion_deadline;
+    }
+
     bool retry_timer_armed = false;
     if (retry_after) {
       arm_retry_timer(*retry_after - now);
@@ -2904,11 +1716,22 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
       control_pipe.service_ready([&](const std::string &command) {
         std::uint32_t current_trace_flags = trace_flags.load();
         const std::string reply = handle_supervisor_control_command(
-            command, workers, options.db_path, current_trace_flags,
-            reload_requested, logger);
+            command, workers, options.db_path, options.log_path,
+            current_trace_flags, reload_requested, logger);
         trace_flags.store(current_trace_flags);
         return reply;
       });
+      {
+        std::uint64_t version = 0;
+        {
+          std::lock_guard lock(g_bridge_mutex);
+          version = g_companion.actuation.version;
+        }
+        if (version != applied_companion_version) {
+          applied_companion_version = version;
+          apply_companion_state(trace_flags.load(), logger);
+        }
+      }
       if (reload_requested) {
         scan_requested = true;
       }
@@ -2949,6 +1772,12 @@ int run_windows_daemon(int argc, char **argv, bool service_mode) {
     }
 
     vds::Logger logger(options.log_path);
+    {
+      vds::BridgeSettings &bridge = vds::bridge_settings();
+      bridge.speaker_boost_db = options.speaker_boost_db;
+      bridge.mic_forced = options.mic_enabled;
+      bridge.mic_allowed = bridge.mic_forced;
+    }
     try {
       TimerResolutionGuard timer_resolution(kWindowsTimerResolutionMs);
       logger.log(
