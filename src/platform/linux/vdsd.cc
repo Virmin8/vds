@@ -131,6 +131,8 @@ constexpr std::size_t kHapticsOnlyAfterSilentPackets = 94;
 // Controller mic open re-sends while waiting for its first packet.
 constexpr std::chrono::milliseconds kMicOpenRetry{250};
 constexpr std::uint32_t kMicOpenMaxResends = 20;
+// Mic peak (permille of full scale) above which a packet counts as sound.
+constexpr std::uint16_t kMicSoundPermille = 10;
 // Controller audio buffer (3 kHz samples) used while the mic records; the
 // value upstream sends with the mic.
 constexpr std::uint8_t kMicBufferLength = 64;
@@ -212,6 +214,9 @@ struct AudioStats {
   Clock::time_point last_mic_close_resend{};
   // Time from opening the controller mic to its first packet (last start).
   std::int64_t mic_startup_ms = -1;
+  // Time from opening the mic to the first packet above near-silence (last
+  // start); shows a mic that warms up after it is switched on.
+  std::int64_t mic_first_sound_ms = -1;
   std::uint64_t window_late = 0;
   std::uint64_t window_refills = 0;
   std::int64_t window_max_gap_us = 0;
@@ -291,6 +296,7 @@ struct VirtualPort {
   Clock::time_point mic_open_resent_at{};
   std::uint32_t mic_open_resends = 0;
   bool mic_first_packet = false;
+  bool mic_first_sound = false;
   bool mic_muted = false;
   bool mute_button_down = false;
   bool headset_plugged = false;
@@ -832,6 +838,7 @@ void sync_port_mic(VirtualPort &port, vds::BtL2capBackend *bt_backend,
     port.mic_open_resent_at = port.mic_opened_at;
     port.mic_open_resends = 0;
     port.mic_first_packet = false;
+    port.mic_first_sound = false;
   }
   if (bt_backend && (open_changed || (open && mute_changed))) {
     bt_backend->try_send_output_report(
@@ -1331,6 +1338,18 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
       auto pcm = port.mic_decoder.decode(*opus_payload);
       port.trace_state.mic_peak_permille =
           vds::scale_mic_pcm(pcm, g_mic_volume_percent, port.mic_muted);
+      if (!port.mic_first_sound &&
+          port.trace_state.mic_peak_permille >= kMicSoundPermille) {
+        port.mic_first_sound = true;
+        port.audio_stats.mic_first_sound_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                read_time - port.mic_opened_at)
+                .count();
+        logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
+                   port.path + " controller mic first sound after " +
+                       std::to_string(port.audio_stats.mic_first_sound_ms) +
+                       " ms");
+      }
       port.trace_state.mic_last_decoded_bytes =
           static_cast<std::uint16_t>(pcm.size());
       const auto frame = vds::frame_bytes(VDS_FRAME_USB_AUDIO_IN, pcm);
@@ -2990,6 +3009,7 @@ std::string handle_audio_stats_request(std::span<const VirtualPort> ports,
              fixed(window_s > 0.0 ? stats.window_mic_packets / window_s : 0.0, 1);
     reply += ",\"mic_packets_total\":" + std::to_string(stats.mic_packets_total);
     reply += ",\"mic_startup_ms\":" + std::to_string(stats.mic_startup_ms);
+    reply += ",\"mic_first_sound_ms\":" + std::to_string(stats.mic_first_sound_ms);
     reply += ",\"mic_while_closed_total\":" +
              std::to_string(stats.mic_while_closed_total);
     reply += ",\"haptics_only_total\":" + std::to_string(stats.haptics_only_total);
