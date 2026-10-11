@@ -19,14 +19,21 @@ int main() {
   state.set_audio_out_stream_active(true);
 
   assert(state.state()[37] == 6);
-  assert(state.state()[7] == 0x30);
+  assert((state.state()[7] & 0x30) == 0x30); // speaker path; low bits: mic select
 
   std::array<std::int8_t, vds::kHapticsSampleSize> haptics{};
   std::array<std::uint8_t, vds::kSpeakerOpusSize> speaker{};
   vds::HapticsPacketBuilder builder;
-  const auto packet = builder.build_packet(haptics, speaker, state.state());
+  const auto packet = builder.build_packet(haptics, speaker, state.state(), false, false);
 
   assert(packet[4] == 0xfe);
+  // Mic sections on and a headset plugged: headphone speaker block and path.
+  vds::HapticsPacketBuilder headset_builder;
+  const auto headset_packet =
+      headset_builder.build_packet(haptics, speaker, state.state(), true, true);
+  assert(headset_packet[4] == 0xff);
+  assert(headset_packet[142] == (0x16 | 0x80));
+  assert((headset_packet[13 + 7] & 0x30) == 0x00);
   // Audio buffer length: default 64, then whatever the companion app sets.
   for (std::size_t i = 5; i <= 9; ++i) {
     assert(packet[i] == 64);
@@ -34,11 +41,11 @@ int main() {
   vds::HapticsPacketBuilder short_buffer;
   short_buffer.set_buffer_length(24);
   const auto short_packet =
-      short_buffer.build_packet(haptics, speaker, state.state());
+      short_buffer.build_packet(haptics, speaker, state.state(), false, false);
   for (std::size_t i = 5; i <= 9; ++i) {
     assert(short_packet[i] == 24);
   }
-  assert(packet[13 + 7] == 0x30);
+  assert((packet[13 + 7] & 0x30) == 0x30);
   assert((packet[13 + 37] & 0x07) == 6);
   assert((packet[13] & 0x40) == 0);
   assert((packet[13 + 1] & 0x01) == 0);
@@ -50,24 +57,24 @@ int main() {
   // hardware volume register stays at full scale.
   overrides.speaker_volume_percent = 50;
   state.set_companion_overrides(overrides);
-  const auto scaled = builder.build_packet(haptics, speaker, state.state());
+  const auto scaled = builder.build_packet(haptics, speaker, state.state(), false, false);
   assert(scaled[13 + 5] == 0x64);
 
-  // The mute light is always forced off (no microphone over vds), even when
-  // the host (hid-playstation) asks for it.
+  // The mic is forwarded now, so the mute light follows the host
+  // (hid-playstation) instead of being forced off.
   std::array<std::uint8_t, 1 + VDS_SET_STATE_SIZE> mute_light{};
   mute_light[0] = VDS_USB_OUTPUT_REPORT_ID;
   mute_light[1 + 1] = 0x01; // allow_mute_light
   mute_light[1 + 8] = 0x01; // mute light on
   assert(state.apply_usb_output_report(mute_light));
   assert((state.state()[1] & 0x01) != 0);
-  assert(state.state()[8] == 0);
+  assert(state.state()[8] == 0x01);
 
   // Audio packets must never write power-save/mic-mute state.
   vds::DsState muted = state.state();
   muted[1] |= 0x02;
   muted[9] = 0x10 | 0x01;
-  const auto mic = builder.build_packet(haptics, speaker, muted);
+  const auto mic = builder.build_packet(haptics, speaker, muted, false, false);
   assert((mic[13 + 1] & 0x02) == 0);
   assert(mic[13 + 9] == 0);
 
@@ -79,9 +86,9 @@ int main() {
   assert(delivered[9] == 0x11);
   assert(vds::state_after_audio_packet(unmuted, unmuted) == unmuted);
 
-  vds::PcmAudioExtractor extractor{vds::kSpeakerInputFrames};
+  vds::PcmAudioExtractor extractor{vds::kPcmWindowFrames};
   const std::vector<std::uint8_t> pcm(
-      vds::kSpeakerInputFrames * VDS_AUDIO_CHANNELS * sizeof(std::int16_t),
+      vds::kPcmWindowFrames * VDS_AUDIO_CHANNELS * sizeof(std::int16_t),
       0);
   assert(extractor.push_usb_audio(pcm).size() == 1);
 }

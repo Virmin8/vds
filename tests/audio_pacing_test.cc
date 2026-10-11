@@ -91,8 +91,8 @@ void haptics_only_packet() {
   vds::HapticsPacketBuilder short_builder;
   full_builder.set_buffer_length(48);
   short_builder.set_buffer_length(48);
-  const auto full = full_builder.build_packet(haptics, speaker, state);
-  const auto only = short_builder.build_haptics_only_packet(haptics, state);
+  const auto full = full_builder.build_packet(haptics, speaker, state, false, false);
+  const auto only = short_builder.build_haptics_only_packet(haptics, state, false, false);
 
   assert(only.size() == vds::kBtHapticsOnlyReportSize);
   assert(only[0] == vds::kBtHapticsOnlyReportId);

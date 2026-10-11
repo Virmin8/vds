@@ -54,26 +54,26 @@ $ScStartType = Convert-VdsServiceStartType -Value $StartupType
 if (Test-VdsServiceExists -Name $ServiceName) {
   Write-Host "Updating Windows service $ServiceName"
   Invoke-VdsSc -Arguments @(
-  "config",
-  $ServiceName,
-  "binPath=",
-  $QuotedBinary,
-  "start=",
-  $ScStartType,
-  "DisplayName=",
-  $DisplayName
+    "config",
+    $ServiceName,
+    "binPath=",
+    $QuotedBinary,
+    "start=",
+    $ScStartType,
+    "DisplayName=",
+    $DisplayName
   )
 } else {
   Write-Host "Registering Windows service $ServiceName"
   Invoke-VdsSc -Arguments @(
-  "create",
-  $ServiceName,
-  "binPath=",
-  $QuotedBinary,
-  "start=",
-  $ScStartType,
-  "DisplayName=",
-  $DisplayName
+    "create",
+    $ServiceName,
+    "binPath=",
+    $QuotedBinary,
+    "start=",
+    $ScStartType,
+    "DisplayName=",
+    $DisplayName
   )
 }
 

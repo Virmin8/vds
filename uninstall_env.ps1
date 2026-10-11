@@ -11,7 +11,7 @@ function Test-VdsElevated {
   $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
   return $Principal.IsInRole(
-  [Security.Principal.WindowsBuiltInRole]::Administrator
+    [Security.Principal.WindowsBuiltInRole]::Administrator
   )
 }
 
@@ -44,12 +44,12 @@ function Remove-VdsPathListEntry {
 
   $NormalizedPath = $Path.TrimEnd("\")
   return @(
-  $Entries | Where-Object {
-    -not $_.TrimEnd("\").Equals(
-    $NormalizedPath,
-    [System.StringComparison]::OrdinalIgnoreCase
-    )
-  }
+    $Entries | Where-Object {
+      -not $_.TrimEnd("\").Equals(
+        $NormalizedPath,
+        [System.StringComparison]::OrdinalIgnoreCase
+      )
+    }
   )
 }
 
@@ -88,14 +88,14 @@ $PathValue = [System.Environment]::GetEnvironmentVariable("Path", $Target)
 $Entries = @(Split-VdsPathList -Value $PathValue)
 $Entries = @(Remove-VdsPathListEntry -Entries $Entries -Path $ResolvedPath)
 [System.Environment]::SetEnvironmentVariable(
-"Path",
-(Join-VdsPathList -Entries $Entries),
-$Target
+  "Path",
+  (Join-VdsPathList -Entries $Entries),
+  $Target
 )
 
 $ProcessEntries = @(Split-VdsPathList -Value $env:Path)
 $ProcessEntries = @(
-Remove-VdsPathListEntry -Entries $ProcessEntries -Path $ResolvedPath
+  Remove-VdsPathListEntry -Entries $ProcessEntries -Path $ResolvedPath
 )
 $env:Path = Join-VdsPathList -Entries $ProcessEntries
 

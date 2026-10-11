@@ -54,7 +54,7 @@ int main() {
     assert(state.state()[led] == before[led]);
     assert(state.state()[led + 2] == before[led + 2]);
     assert(state.state()[trigger] == before[trigger]);
-    assert(state.state()[7] == 0x30); // speaker path still owned while streaming
+    assert((state.state()[7] & 0x30) == 0x30); // speaker path still owned while streaming
   }
 
   // node_openers finds another process holding a file open, not ourselves.

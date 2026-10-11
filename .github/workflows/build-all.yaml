@@ -159,10 +159,6 @@ jobs:
 
           Install-VdsWingetPackage -PackageId Git.Git
           Install-VdsWingetPackage -PackageId Kitware.CMake
-          winget configure `
-            -f https://raw.githubusercontent.com/microsoft/Windows-driver-samples/main/_wdk_utils/winget/configs/wdk-vscommunity.dsc.yaml `
-            --accept-configuration-agreements `
-            --disable-interactivity
           Install-VdsWingetPackage -PackageId Microsoft.VCRedist.2015+.x64
 
           $Vcpkg = Get-Command vcpkg.exe -ErrorAction SilentlyContinue
@@ -172,7 +168,6 @@ jobs:
             $VcpkgPath = "C:\vcpkg\vcpkg.exe"
           }
 
-          & $VcpkgPath install opus:x64-windows
           $VcpkgRoot = Split-Path -Parent $VcpkgPath
           "VDS_VCPKG_ROOT=$VcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -190,17 +185,11 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VDS_VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
           cmake --build build\windows --config Release --parallel
 
-      - name: Build signed driver packages
-        shell: pwsh
-        run: |
-          .\windrv\build.ps1
-
       - name: Build Windows setup package
         shell: pwsh
         run: |
           $Args = @{
             ToolsDir = (Resolve-Path "build\windows\Release").Path
-            DriverPackageRoot = (Resolve-Path "windrv").Path
             OutputDir = (Resolve-Path ".").Path + "\dist\windows"
           }
           if (![string]::IsNullOrWhiteSpace("${{ inputs.windows_pkgrel }}")) {
@@ -260,14 +249,77 @@ jobs:
             prerelease=true
           fi
 
+          published_release_tags_output="$(
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+              jq -r \
+                '[.[][] | select(.draft == false)] | sort_by(.published_at) | reverse | .[].tag_name'
+          )"
+          published_release_tags=()
+          if [ -n "$published_release_tags_output" ]; then
+            mapfile -t published_release_tags <<< "$published_release_tags_output"
+          fi
+
+          previous_release_tag=
+          for candidate_tag in "${published_release_tags[@]}"; do
+            if [ "$candidate_tag" = "$RAW_VERSION" ]; then
+              continue
+            fi
+            if ! git check-ref-format "refs/tags/${candidate_tag}" >/dev/null; then
+              echo "Ignoring release with invalid tag: ${candidate_tag}" >&2
+              continue
+            fi
+            if ! git rev-parse \
+              --verify \
+              --quiet \
+              "refs/tags/${candidate_tag}^{commit}" >/dev/null; then
+              git fetch \
+                --no-tags \
+                origin \
+                "refs/tags/${candidate_tag}:refs/tags/${candidate_tag}"
+            fi
+            if git merge-base \
+              --is-ancestor \
+              "refs/tags/${candidate_tag}^{commit}" \
+              "$GITHUB_SHA"; then
+              previous_release_tag="$candidate_tag"
+              break
+            fi
+            echo \
+              "Ignoring release tag outside the current history: ${candidate_tag}" \
+              >&2
+          done
+
+          release_notes="$(mktemp)"
+          {
+            echo '```text'
+            if [ -n "$previous_release_tag" ]; then
+              echo \
+                "Generating release notes from ${previous_release_tag} to ${RAW_VERSION}" \
+                >&2
+              git log \
+                --date-order \
+                --format='- %s' \
+                "${previous_release_tag}..${GITHUB_SHA}"
+            else
+              echo \
+                "No previous published release tag found in the current history" \
+                >&2
+              git log --date-order --format='- %s' "$GITHUB_SHA"
+            fi
+            echo '```'
+          } > "$release_notes"
+
           if gh release view "$RAW_VERSION" >/dev/null 2>&1; then
-            gh release edit "$RAW_VERSION" --title "$RAW_VERSION"
+            gh release edit "$RAW_VERSION" \
+              --title "$RAW_VERSION" \
+              --notes-file "$release_notes"
             gh release upload "$RAW_VERSION" "${assets[@]}" --clobber
           else
             gh release create "$RAW_VERSION" "${assets[@]}" \
               --target "$GITHUB_SHA" \
               --title "$RAW_VERSION" \
-              --notes ""
+              --notes-file "$release_notes"
           fi
 
           release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RAW_VERSION}" --jq .id)"

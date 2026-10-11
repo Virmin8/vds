@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
+// Copyright (C) 2026 Antonio <bleader93@gmail.com>
 //
 // Partly influenced by DS5Dongle source:
 // Copyright (c) 2026 awalol, released under the MIT license.
-//
-// DualSense USB/Bluetooth protocol helpers: CRC, output state merging, HID
-// report framing, and USB audio to Bluetooth haptics/speaker packet conversion.
 
 #include <algorithm>
 #include <array>
@@ -40,14 +38,17 @@ constexpr std::size_t kSetStateSize = VDS_SET_STATE_SIZE;
 constexpr std::size_t kBtStateOffset = 3;
 constexpr std::size_t kSpeakerBlockOffset = 142;
 constexpr std::size_t kSpeakerDataOffset = 144;
+constexpr std::uint8_t kSpeakerBlockControllerSpeaker = 0x13;
+constexpr std::uint8_t kSpeakerBlockHeadphones = 0x16;
 constexpr int kSpeakerOpusBitrate = kSpeakerOpusSize * 8 * 100;
+constexpr std::uint8_t kBtAudioBufferLength = 64;
 constexpr std::size_t kOutputFlag0Offset = 0;
 constexpr std::size_t kOutputFlag1Offset = 1;
 constexpr std::size_t kOutputHeadphoneVolumeOffset = 4;
 constexpr std::size_t kOutputSpeakerVolumeOffset = 5;
 constexpr std::size_t kOutputMicVolumeOffset = 6;
 constexpr std::size_t kOutputAudioControlOffset = 7;
-constexpr std::size_t kOutputMuteLightModeOffset = 8;
+constexpr std::size_t kOutputMuteLedOffset = 8;
 constexpr std::size_t kOutputPowerSaveControlOffset = 9;
 constexpr std::size_t kOutputAudioControl2Offset = 37;
 constexpr std::size_t kOutputLightBrightnessOffset =
@@ -60,11 +61,14 @@ constexpr std::uint8_t kBtHidpFeaturePrefix = 0xa3;
 constexpr std::uint8_t kBtHidpGetFeaturePrefix = 0x43;
 constexpr std::uint8_t kBtHidpSetFeaturePrefix = 0x53;
 constexpr std::size_t kBtInputReportIdOffset = 1;
-constexpr std::size_t kBtInputFlagsOffset = 2;
+constexpr std::size_t kBtInputHeaderOffset = 2;
 constexpr std::size_t kBtInputUsbPayloadOffset = 3;
 constexpr std::size_t kBtInputMinimumSize =
     kBtInputUsbPayloadOffset + VDS_USB_INPUT_PAYLOAD_SIZE;
-constexpr std::uint8_t kBtInputFlagMicrophoneAudio = 0x02;
+constexpr std::size_t kBtMicOpusOffset = 4;
+constexpr std::uint8_t kBtInputPayloadTypeMask = 0x0f;
+constexpr std::uint8_t kBtInputPayloadTypeControl = 0x01;
+constexpr std::uint8_t kBtInputPayloadTypeAudio = 0x02;
 constexpr std::uint8_t kOutputFlag0HeadphoneVolumeEnable = 0x10;
 constexpr std::uint8_t kOutputFlag0SpeakerVolumeEnable = 0x20;
 constexpr std::uint8_t kOutputFlag0MicVolumeEnable = 0x40;
@@ -74,14 +78,81 @@ constexpr std::uint8_t kOutputFlag1PowerSaveControlEnable = 0x02;
 constexpr std::uint8_t kOutputFlag1AudioControl2Enable = 0x80;
 constexpr std::uint8_t kOutputHeadphoneVolumeMax = 0x7f;
 constexpr std::uint8_t kOutputSpeakerVolumeMax = 0x64;
+constexpr std::uint8_t kOutputSpeakerPreampGain = 0x02;
+constexpr std::uint8_t kOutputMicSelectMask = 0x03;
+constexpr std::uint8_t kOutputMicSelectAuto = 0x00;
+constexpr std::uint8_t kOutputMicSelectInternal = 0x01;
+constexpr std::uint8_t kOutputMicAudioControl = 0x09;
+constexpr std::uint8_t kOutputMicVolumeDefault = 0x08;
+constexpr std::uint8_t kOutputAudioControl2Default = 0x01;
+constexpr std::uint8_t kOutputAudioControlNonPathMask = 0xcf;
 constexpr std::uint8_t kOutputPathHeadphones = 0x00;
 constexpr std::uint8_t kOutputPathSpeaker = 0x30;
-constexpr std::uint8_t kOutputSpeakerPreampGain = 0x02;
-constexpr DsState kInitialDsState{
-    0xfd, 0xf7, 0x00, 0x00, 0x7f, 0x64, 0xff, 0x09, 0x00, 0x0f, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x0a, 0x07, 0x00, 0x00, 0x02, 0x01, 0x00, 0xff, 0xd7, 0x00};
+constexpr std::uint8_t kOutputPathMask = 0x30;
+constexpr std::uint8_t kOutputPowerSaveMicMute = 0x10;
+constexpr std::uint8_t kBtAudioSectionsEnable = 0xff;
+constexpr std::uint8_t kBtAudioSectionsDisableMic = 0xfe;
+constexpr std::uint8_t kBtMicReportId = 0x32;
+constexpr std::uint8_t kBtMicOpen = 0xff;
+constexpr std::uint8_t kBtMicClose = 0xfe;
+constexpr std::array<std::uint8_t, kSetStateSize> kInitialSetStateData{
+    0xfd,
+    0xf7,
+    0x00,
+    0x00,
+    0x7f,
+    0x64,
+    kOutputMicVolumeDefault,
+    kOutputMicAudioControl,
+    0x00,
+    0x0f,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    kOutputAudioControl2Default,
+    0x07,
+    0x00,
+    0x00,
+    0x02,
+    0x01,
+    0x00,
+    0xff,
+    0xd7,
+    0x00};
+
+constexpr DsState initial_ds_state() {
+  DsState state{};
+  for (std::size_t i = 0; i < kInitialSetStateData.size(); ++i) {
+    state[i] = kInitialSetStateData[i];
+  }
+  return state;
+}
+
+constexpr DsState kInitialDsState = initial_ds_state();
 static_assert(kHapticsSampleSize % kSpeakerChannels == 0);
 
 constexpr std::uint32_t crc32_table_entry(std::uint32_t index) {
@@ -117,6 +188,13 @@ double bessel_i0(double x) {
     sum += term;
   }
   return sum;
+}
+
+std::uint8_t audio_control_with_output_path(std::uint8_t audio_control,
+                                            std::uint8_t output_path) {
+  return static_cast<std::uint8_t>(
+      (audio_control & static_cast<std::uint8_t>(~kOutputPathMask)) |
+      output_path);
 }
 
 void opus_ctl_checked(int result, const char *name) {
@@ -473,21 +551,21 @@ struct PcmAudioExtractor::SpeakerEncoder {
   SpeakerEncoder &operator=(const SpeakerEncoder &) = delete;
 
   SpeakerChunk encode(std::span<std::int16_t> input) {
-    SpeakerChunk output{};
+    SpeakerChunk chunk{};
     enhancer.process(input, input.size() / kSpeakerChannels);
-    const auto opus_input = resampler.process(input);
+    const auto opus_pcm = resampler.process(input);
     const int bytes =
-        opus_encode(encoder, opus_input.data(), kSpeakerOpusFrames,
-                    output.data(), static_cast<opus_int32>(output.size()));
+        opus_encode(encoder, opus_pcm.data(), kSpeakerOpusFrames, chunk.data(),
+                    static_cast<opus_int32>(chunk.size()));
     if (bytes < 0) {
       throw std::runtime_error("opus_encode failed: " +
                                std::string(opus_strerror(bytes)));
     }
-    if (static_cast<std::size_t>(bytes) < output.size()) {
-      std::fill(output.begin() + static_cast<std::ptrdiff_t>(bytes),
-                output.end(), 0);
+    if (static_cast<std::size_t>(bytes) < chunk.size()) {
+      std::fill(chunk.begin() + static_cast<std::ptrdiff_t>(bytes), chunk.end(),
+                0);
     }
-    return output;
+    return chunk;
   }
 
   void set_mono(bool value) {
@@ -506,13 +584,62 @@ struct PcmAudioExtractor::SpeakerEncoder {
   bool mono = false;
 };
 
+struct MicAudioDecoder::Decoder {
+  Decoder() {
+    int error = OPUS_OK;
+    decoder = opus_decoder_create(VDS_AUDIO_SAMPLE_RATE, 1, &error);
+    if (!decoder || error != OPUS_OK) {
+      throw std::runtime_error("opus_decoder_create failed: " +
+                               std::string(opus_strerror(error)));
+    }
+  }
+
+  ~Decoder() {
+    if (decoder) {
+      opus_decoder_destroy(decoder);
+    }
+  }
+
+  Decoder(const Decoder &) = delete;
+  Decoder &operator=(const Decoder &) = delete;
+
+  std::vector<std::uint8_t>
+  decode(std::span<const std::uint8_t, kMicOpusSize> payload) {
+    std::array<opus_int16, kMicOpusFrames> mono{};
+    const int frames = opus_decode(
+        decoder, payload.data(), static_cast<opus_int32>(payload.size()),
+        mono.data(), static_cast<int>(mono.size()), 0);
+    if (frames < 0) {
+      throw std::runtime_error("opus_decode failed: " +
+                               std::string(opus_strerror(frames)));
+    }
+
+    std::vector<std::uint8_t> pcm(static_cast<std::size_t>(frames) *
+                                  kMicUsbChannels * sizeof(std::int16_t));
+    for (int frame = 0; frame < frames; ++frame) {
+      const auto sample = static_cast<std::uint16_t>(mono[frame]);
+      const auto low = static_cast<std::uint8_t>(sample & 0xff);
+      const auto high = static_cast<std::uint8_t>((sample >> 8) & 0xff);
+      const std::size_t offset = static_cast<std::size_t>(frame) *
+                                 kMicUsbChannels * sizeof(std::int16_t);
+      pcm[offset + 0] = 0;
+      pcm[offset + 1] = 0;
+      pcm[offset + 2] = low;
+      pcm[offset + 3] = high;
+    }
+    return pcm;
+  }
+
+  OpusDecoder *decoder = nullptr;
+};
+
 PcmAudioExtractor::PcmAudioExtractor(std::size_t speaker_input_frames)
     : speaker_encoder_(std::make_unique<SpeakerEncoder>(speaker_input_frames)),
       haptics_resampler_(speaker_input_frames),
-      speaker_input_frames_(speaker_input_frames) {
-  if (speaker_input_frames_ == 0 ||
-      speaker_input_frames_ > kSpeakerInputFrames ||
-      speaker_input_frames_ % kHapticsDecimation != 0) {
+      pcm_window_frames_(speaker_input_frames) {
+  if (pcm_window_frames_ == 0 ||
+      pcm_window_frames_ > kPcmWindowFrames ||
+      pcm_window_frames_ % kHapticsDecimation != 0) {
     throw std::invalid_argument("unsupported speaker input frame window");
   }
 }
@@ -568,9 +695,7 @@ void fill_feature_report_checksum(std::span<std::uint8_t> report) {
 
 std::vector<std::uint8_t>
 hidp_output_packet(std::span<const std::uint8_t> report) {
-  std::vector<std::uint8_t> packet;
-  packet.reserve(report.size() + 1);
-  packet.push_back(kBtHidpOutputPrefix);
+  std::vector<std::uint8_t> packet{kBtHidpOutputPrefix};
   packet.insert(packet.end(), report.begin(), report.end());
   return packet;
 }
@@ -600,10 +725,10 @@ feature_set_packet(std::span<const std::uint8_t> report) {
 std::optional<UsbInputReport>
 bt_input_to_usb_input(std::span<const std::uint8_t> packet) {
   if (packet.size() < kBtInputMinimumSize || packet[0] != kBtHidpInputPrefix ||
-      packet[kBtInputReportIdOffset] != VDS_BT_STATE_REPORT_ID) {
-    return std::nullopt;
-  }
-  if ((packet[kBtInputFlagsOffset] & kBtInputFlagMicrophoneAudio) != 0) {
+      packet[kBtInputReportIdOffset] != VDS_BT_STATE_REPORT_ID ||
+      // Anything but mic audio is controller input, so an unexpected header
+      // nibble cannot silence the controller.
+      bt_input_payload_type(packet) == BtInputPayloadType::Audio) {
     return std::nullopt;
   }
 
@@ -614,6 +739,33 @@ bt_input_to_usb_input(std::span<const std::uint8_t> packet) {
             packet.begin() + static_cast<std::ptrdiff_t>(kBtInputMinimumSize),
             report.begin() + 1);
   return report;
+}
+
+BtInputPayloadType bt_input_payload_type(std::span<const std::uint8_t> packet) {
+  if (packet.size() <= kBtInputHeaderOffset ||
+      packet[0] != kBtHidpInputPrefix ||
+      packet[kBtInputReportIdOffset] != VDS_BT_STATE_REPORT_ID) {
+    return BtInputPayloadType::Unknown;
+  }
+
+  switch (packet[kBtInputHeaderOffset] & kBtInputPayloadTypeMask) {
+  case kBtInputPayloadTypeControl:
+    return BtInputPayloadType::Control;
+  case kBtInputPayloadTypeAudio:
+    return BtInputPayloadType::Audio;
+  default:
+    return BtInputPayloadType::Unknown;
+  }
+}
+
+std::optional<std::span<const std::uint8_t, kMicOpusSize>>
+bt_mic_opus_payload(std::span<const std::uint8_t> packet) {
+  if (bt_input_payload_type(packet) != BtInputPayloadType::Audio ||
+      packet.size() < kBtMicOpusOffset + kMicOpusSize) {
+    return std::nullopt;
+  }
+  return std::span<const std::uint8_t, kMicOpusSize>(
+      packet.data() + kBtMicOpusOffset, kMicOpusSize);
 }
 
 std::optional<std::vector<std::uint8_t>>
@@ -897,10 +1049,32 @@ void encode_companion_trigger_effect_v2(
   }
 }
 
+MicAudioDecoder::MicAudioDecoder() : decoder_(std::make_unique<Decoder>()) {}
+
+MicAudioDecoder::~MicAudioDecoder() = default;
+
+MicAudioDecoder::MicAudioDecoder(MicAudioDecoder &&) noexcept = default;
+
+MicAudioDecoder &
+MicAudioDecoder::operator=(MicAudioDecoder &&) noexcept = default;
+
+std::vector<std::uint8_t>
+MicAudioDecoder::decode(std::span<const std::uint8_t, kMicOpusSize> payload) {
+  return decoder_->decode(payload);
+}
+
 DsOutputState::DsOutputState()
     : state_(kInitialDsState), light_color_{state_[kOutputLedColorOffset + 0],
                                             state_[kOutputLedColorOffset + 1],
                                             state_[kOutputLedColorOffset + 2]},
+      headphones_volume_(state_[kOutputHeadphoneVolumeOffset]),
+      speaker_volume_(state_[kOutputSpeakerVolumeOffset]),
+      mic_volume_(state_[kOutputMicVolumeOffset]),
+      audio_control_(state_[kOutputAudioControlOffset] &
+                     kOutputAudioControlNonPathMask),
+      audio_output_path_(state_[kOutputAudioControlOffset] & kOutputPathMask),
+      audio_control2_(state_[kOutputAudioControl2Offset]),
+      power_save_control_(state_[kOutputPowerSaveControlOffset]),
       light_brightness_(state_[kOutputLightBrightnessOffset]) {
   recompute_effective_state();
 }
@@ -936,11 +1110,6 @@ void DsOutputState::recompute_effective_state() {
                      companion_.lightbar_brightness_percent);
     }
   }
-
-  // There is no microphone over vds, so the mute light would only mislead:
-  // Linux hid-playstation toggles it on every Mute press. Keep it off.
-  effective_state_[kOutputFlag1Offset] |= kOutputFlag1MicMuteLedControlEnable;
-  effective_state_[kOutputMuteLightModeOffset] = 0;
 
   if (!companion_.player_led_enabled) {
     set_state_bit(effective_state_[1], 4, true); // allow_player_indicators
@@ -1008,10 +1177,11 @@ void DsOutputState::recompute_effective_state() {
   // scaling it made small slider moves very quiet.
   // Like the DS5 Bridge firmware, only own the speaker path and preamp gain
   // while the speaker stream is active; otherwise leave the game's values.
-  if (audio_out_stream_active_) {
+  if (audio_out_stream_active_ && !audio_out_headset_) {
     effective_state_[kOutputFlag0Offset] |=
         kOutputFlag0AudioControlEnable | kOutputFlag0SpeakerVolumeEnable;
-    effective_state_[kOutputAudioControlOffset] = kOutputPathSpeaker;
+    effective_state_[kOutputAudioControlOffset] = audio_control_with_output_path(
+        effective_state_[kOutputAudioControlOffset], kOutputPathSpeaker);
     effective_state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
     effective_state_[kOutputAudioControl2Offset] =
         static_cast<std::uint8_t>(
@@ -1031,7 +1201,17 @@ void DsOutputState::restore_host_state(const HostState &snapshot) {
   emulate_light_brightness_ = snapshot.emulate_light_brightness;
   // Re-applies the speaker routing bits for the stream as it is now, and
   // recomputes the effective state.
-  set_audio_out_stream_active(audio_out_stream_active_);
+  set_audio_out_stream_active(audio_out_stream_active_, audio_out_headset_);
+}
+
+void DsOutputState::apply_mic_select() {
+  audio_control_ =
+      static_cast<std::uint8_t>(audio_control_ & ~kOutputMicSelectMask);
+  audio_control_ |=
+      headset_mic_plugged_ ? kOutputMicSelectAuto : kOutputMicSelectInternal;
+  state_[kOutputFlag0Offset] |= kOutputFlag0AudioControlEnable;
+  state_[kOutputAudioControlOffset] =
+      audio_control_with_output_path(audio_control_, audio_output_path_);
 }
 
 BtInitReport DsOutputState::build_bt_init_report() {
@@ -1072,30 +1252,51 @@ bool DsOutputState::apply_usb_output_report(
   }
   if (decoded.allow_headphone_volume) {
     state_[kOutputFlag0Offset] |= kOutputFlag0HeadphoneVolumeEnable;
+    headphones_volume_ = decoded.volume_headphones;
     copy_state_bytes(state_, update,
                      offsetof(vds_set_state_data, volume_headphones),
                      sizeof(decoded.volume_headphones));
   }
   if (decoded.allow_speaker_volume) {
     state_[kOutputFlag0Offset] |= kOutputFlag0SpeakerVolumeEnable;
+    speaker_volume_ = decoded.volume_speaker;
     copy_state_bytes(state_, update,
                      offsetof(vds_set_state_data, volume_speaker),
                      sizeof(decoded.volume_speaker));
   }
+  if (decoded.allow_mic_volume) {
+    state_[kOutputFlag0Offset] |= kOutputFlag0MicVolumeEnable;
+    mic_volume_ = decoded.volume_mic;
+    state_[kOutputMicVolumeOffset] = mic_volume_;
+  }
   if (decoded.allow_audio_control) {
     state_[kOutputFlag0Offset] |= kOutputFlag0AudioControlEnable;
-    copy_state_bytes(state_, update, kOutputAudioControlOffset, 1);
+    const std::uint8_t requested_control = update[kOutputAudioControlOffset];
+    const std::uint8_t requested_non_path =
+        requested_control & kOutputAudioControlNonPathMask;
+    if (requested_non_path != 0) {
+      audio_control_ = requested_non_path;
+    }
+    audio_output_path_ = requested_control & kOutputPathMask;
+    apply_mic_select();
   }
   if (decoded.allow_audio_control2) {
     state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
+    audio_control2_ = update[kOutputAudioControl2Offset];
     copy_state_bytes(state_, update, kOutputAudioControl2Offset, 1);
+  }
+  if (decoded.allow_audio_mute) {
+    state_[kOutputFlag1Offset] |= kOutputFlag1PowerSaveControlEnable;
+    power_save_control_ = update[kOutputPowerSaveControlOffset];
+    state_[kOutputPowerSaveControlOffset] = power_save_control_;
   }
   if (decoded.allow_speaker_volume && decoded.volume_speaker != 0) {
     state_[kOutputFlag0Offset] |=
         kOutputFlag0AudioControlEnable | kOutputFlag0SpeakerVolumeEnable;
     state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
-    state_[kOutputAudioControlOffset] = kOutputPathSpeaker;
-    state_[kOutputAudioControl2Offset] = kOutputSpeakerPreampGain;
+    state_[kOutputAudioControlOffset] =
+        audio_control_with_output_path(audio_control_, kOutputPathSpeaker);
+    state_[kOutputAudioControl2Offset] = audio_control2_;
   }
   if (decoded.allow_mute_light) {
     copy_state_bytes(state_, update,
@@ -1146,17 +1347,34 @@ bool DsOutputState::apply_usb_output_report(
   return true;
 }
 
-void DsOutputState::set_audio_out_stream_active(bool active) {
+void DsOutputState::set_audio_out_stream_active(bool active,
+                                                bool headset_plugged) {
   audio_out_stream_active_ = active;
+  audio_out_headset_ = headset_plugged;
   state_[kOutputFlag0Offset] |= kOutputFlag0AudioControlEnable;
-  state_[kOutputHeadphoneVolumeOffset] = kOutputHeadphoneVolumeMax;
+  state_[kOutputHeadphoneVolumeOffset] = headphones_volume_;
 
   if (active) {
-    state_[kOutputFlag0Offset] |= kOutputFlag0SpeakerVolumeEnable;
-    state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
-    state_[kOutputSpeakerVolumeOffset] = kOutputSpeakerVolumeMax;
-    state_[kOutputAudioControlOffset] = kOutputPathSpeaker;
-    state_[kOutputAudioControl2Offset] = kOutputSpeakerPreampGain;
+    if (headset_plugged) {
+      state_[kOutputFlag0Offset] |= kOutputFlag0HeadphoneVolumeEnable;
+      state_[kOutputFlag0Offset] &= ~kOutputFlag0SpeakerVolumeEnable;
+      state_[kOutputFlag1Offset] &= ~kOutputFlag1AudioControl2Enable;
+      state_[kOutputSpeakerVolumeOffset] = 0;
+      state_[kOutputAudioControl2Offset] = 0;
+      audio_output_path_ = kOutputPathHeadphones;
+      state_[kOutputAudioControlOffset] =
+          audio_control_with_output_path(audio_control_, audio_output_path_);
+    } else {
+      state_[kOutputFlag0Offset] |= kOutputFlag0SpeakerVolumeEnable;
+      state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
+      // Hardware volume stays at max; the companion volume is applied to the
+      // audio itself (SpeakerEnhancer).
+      state_[kOutputSpeakerVolumeOffset] = kOutputSpeakerVolumeMax;
+      state_[kOutputAudioControl2Offset] = kOutputSpeakerPreampGain;
+      audio_output_path_ = kOutputPathSpeaker;
+      state_[kOutputAudioControlOffset] =
+          audio_control_with_output_path(audio_control_, audio_output_path_);
+    }
     recompute_effective_state();
     return;
   }
@@ -1164,9 +1382,84 @@ void DsOutputState::set_audio_out_stream_active(bool active) {
   state_[kOutputFlag0Offset] &= ~kOutputFlag0SpeakerVolumeEnable;
   state_[kOutputFlag1Offset] &= ~kOutputFlag1AudioControl2Enable;
   state_[kOutputSpeakerVolumeOffset] = 0;
-  state_[kOutputAudioControlOffset] = kOutputPathHeadphones;
   state_[kOutputAudioControl2Offset] = 0;
+  audio_output_path_ = kOutputPathHeadphones;
+  state_[kOutputAudioControlOffset] =
+      audio_control_with_output_path(audio_control_, audio_output_path_);
   recompute_effective_state();
+}
+
+void DsOutputState::set_headset_mic_plugged(bool plugged) {
+  headset_mic_plugged_ = plugged;
+  state_[kOutputFlag0Offset] |=
+      kOutputFlag0MicVolumeEnable | kOutputFlag0AudioControlEnable;
+  state_[kOutputMicVolumeOffset] = mic_volume_;
+  apply_mic_select();
+  recompute_effective_state();
+}
+
+BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
+                                                       bool muted) {
+  const std::uint8_t power_save_control =
+      active && !muted
+          ? static_cast<std::uint8_t>(
+                power_save_control_ &
+                static_cast<std::uint8_t>(~kOutputPowerSaveMicMute))
+          : static_cast<std::uint8_t>(power_save_control_ |
+                                      kOutputPowerSaveMicMute);
+
+  state_[kOutputFlag0Offset] |=
+      kOutputFlag0MicVolumeEnable | kOutputFlag0AudioControlEnable;
+  state_[kOutputFlag1Offset] |= kOutputFlag1MicMuteLedControlEnable |
+                                kOutputFlag1PowerSaveControlEnable |
+                                kOutputFlag1AudioControl2Enable;
+  const std::uint8_t audio_control =
+      audio_control_with_output_path(audio_control_, audio_output_path_);
+  state_[kOutputMicVolumeOffset] = active && !muted ? mic_volume_ : 0;
+  state_[kOutputAudioControlOffset] = audio_control;
+  state_[kOutputAudioControl2Offset] = audio_control2_;
+  state_[kOutputMuteLedOffset] = muted ? 1 : 0;
+  state_[kOutputPowerSaveControlOffset] = power_save_control;
+  recompute_effective_state();
+
+  BtStateReport report{};
+  report[0] = VDS_BT_STATE_REPORT_ID;
+  report[1] = report_sequence_ << 4;
+  report_sequence_ = (report_sequence_ + 1) & 0x0f;
+  report[2] = 0x10;
+  report[kBtStateOffset + kOutputFlag0Offset] =
+      kOutputFlag0MicVolumeEnable | kOutputFlag0AudioControlEnable;
+  report[kBtStateOffset + kOutputFlag1Offset] =
+      kOutputFlag1MicMuteLedControlEnable | kOutputFlag1PowerSaveControlEnable |
+      kOutputFlag1AudioControl2Enable;
+  report[kBtStateOffset + kOutputMicVolumeOffset] =
+      active && !muted ? mic_volume_ : 0;
+  report[kBtStateOffset + kOutputAudioControlOffset] = audio_control;
+  report[kBtStateOffset + kOutputMuteLedOffset] = muted ? 1 : 0;
+  report[kBtStateOffset + kOutputPowerSaveControlOffset] = power_save_control;
+  report[kBtStateOffset + kOutputAudioControl2Offset] = audio_control2_;
+  fill_output_report_checksum(report);
+  return report;
+}
+
+BtInitReport DsOutputState::build_bt_mic_report(bool active) {
+  BtInitReport report{};
+  report[0] = kBtMicReportId;
+  report[1] = mic_sequence_ << 4;
+  report[2] = 0x91;
+  report[3] = 0x07;
+  report[4] = active ? kBtMicOpen : kBtMicClose;
+  report[5] = kBtAudioBufferLength;
+  report[6] = kBtAudioBufferLength;
+  report[7] = kBtAudioBufferLength;
+  report[8] = kBtAudioBufferLength;
+  report[9] = kBtAudioBufferLength;
+  report[10] = mic_sequence_;
+  report[11] = 0x92;
+  report[12] = 0x40;
+  mic_sequence_ = (mic_sequence_ + 1) & 0x0f;
+  fill_output_report_checksum(report);
+  return report;
 }
 
 BtStateReport DsOutputState::build_bt_state_report() {
@@ -1196,7 +1489,7 @@ DsState state_after_audio_packet(const std::optional<DsState> &previous,
       (state[kOutputFlag1Offset] & ~kFlag1MicMask) |
       (prior[kOutputFlag1Offset] & kFlag1MicMask));
   result[kOutputMicVolumeOffset] = prior[kOutputMicVolumeOffset];
-  result[kOutputMuteLightModeOffset] = prior[kOutputMuteLightModeOffset];
+  result[kOutputMuteLedOffset] = prior[kOutputMuteLedOffset];
   result[kOutputPowerSaveControlOffset] = prior[kOutputPowerSaveControlOffset];
   return result;
 }
@@ -1259,13 +1552,15 @@ std::uint8_t HapticsBufferTuner::on_send(std::int64_t gap_us) {
 void HapticsPacketBuilder::write_audio_blocks(
     std::span<std::uint8_t> packet, std::uint8_t report_id,
     std::span<const std::int8_t, kHapticsSampleSize> haptics,
-    std::span<const std::uint8_t, kDsStateSize> state) {
+    std::span<const std::uint8_t, kDsStateSize> state,
+    bool audio_sections_enabled, bool headset_plugged) {
   packet[0] = report_id;
   packet[1] = report_sequence_ << 4;
   report_sequence_ = (report_sequence_ + 1) & 0x0f;
   packet[2] = 0x11 | (1 << 7);
   packet[3] = 7;
-  packet[4] = 0xfe;
+  packet[4] = audio_sections_enabled ? kBtAudioSectionsEnable
+                                     : kBtAudioSectionsDisableMic;
   packet[5] = buffer_length_;
   packet[6] = buffer_length_;
   packet[7] = buffer_length_;
@@ -1284,7 +1579,7 @@ void HapticsPacketBuilder::write_audio_blocks(
         kOutputFlag1PowerSaveControlEnable);
   audio_state[kOutputPowerSaveControlOffset] = 0;
   audio_state[kOutputMicVolumeOffset] = 0;
-  audio_state[kOutputMuteLightModeOffset] = 0;
+  audio_state[kOutputMuteLedOffset] = 0;
   // Keep the companion/game speaker volume; only default to max when nothing
   // has set it.
   if ((audio_state[kOutputFlag0Offset] & kOutputFlag0SpeakerVolumeEnable) ==
@@ -1295,7 +1590,9 @@ void HapticsPacketBuilder::write_audio_blocks(
       kOutputFlag0AudioControlEnable | kOutputFlag0SpeakerVolumeEnable;
   audio_state[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
   audio_state[kOutputHeadphoneVolumeOffset] = kOutputHeadphoneVolumeMax;
-  audio_state[kOutputAudioControlOffset] = kOutputPathSpeaker;
+  audio_state[kOutputAudioControlOffset] = audio_control_with_output_path(
+      audio_state[kOutputAudioControlOffset],
+      headset_plugged ? kOutputPathHeadphones : kOutputPathSpeaker);
   std::copy(audio_state.begin(), audio_state.end(), packet.begin() + 13);
   packet[76] = 0x12 | (1 << 7);
   packet[77] = kHapticsSampleSize;
@@ -1305,10 +1602,15 @@ void HapticsPacketBuilder::write_audio_blocks(
 BtReport HapticsPacketBuilder::build_packet(
     std::span<const std::int8_t, kHapticsSampleSize> haptics,
     std::span<const std::uint8_t, kSpeakerOpusSize> speaker,
-    std::span<const std::uint8_t, kDsStateSize> state) {
+    std::span<const std::uint8_t, kDsStateSize> state,
+    bool audio_sections_enabled, bool headset_plugged) {
   BtReport packet{};
-  write_audio_blocks(packet, VDS_BT_HAPTICS_REPORT_ID, haptics, state);
-  packet[kSpeakerBlockOffset] = 0x13 | (1 << 7);
+  write_audio_blocks(packet, VDS_BT_HAPTICS_REPORT_ID, haptics, state,
+                     audio_sections_enabled, headset_plugged);
+  packet[kSpeakerBlockOffset] =
+      (headset_plugged ? kSpeakerBlockHeadphones
+                       : kSpeakerBlockControllerSpeaker) |
+      (1 << 7);
   packet[kSpeakerBlockOffset + 1] = static_cast<std::uint8_t>(kSpeakerOpusSize);
   std::memcpy(packet.data() + kSpeakerDataOffset, speaker.data(),
               speaker.size());
@@ -1318,11 +1620,13 @@ BtReport HapticsPacketBuilder::build_packet(
 
 BtHapticsOnlyReport HapticsPacketBuilder::build_haptics_only_packet(
     std::span<const std::int8_t, kHapticsSampleSize> haptics,
-    std::span<const std::uint8_t, kDsStateSize> state) {
+    std::span<const std::uint8_t, kDsStateSize> state,
+    bool audio_sections_enabled, bool headset_plugged) {
   static_assert(kSpeakerBlockOffset + sizeof(std::uint32_t) <=
                 kBtHapticsOnlyReportSize);
   BtHapticsOnlyReport packet{};
-  write_audio_blocks(packet, kBtHapticsOnlyReportId, haptics, state);
+  write_audio_blocks(packet, kBtHapticsOnlyReportId, haptics, state,
+                     audio_sections_enabled, headset_plugged);
   fill_output_report_checksum(packet);
   return packet;
 }
@@ -1330,8 +1634,7 @@ BtHapticsOnlyReport HapticsPacketBuilder::build_haptics_only_packet(
 std::vector<AudioChunk>
 PcmAudioExtractor::push_usb_audio(std::span<const std::uint8_t> pcm_bytes) {
   std::vector<AudioChunk> chunks;
-  chunks.reserve(pcm_bytes.size() / (kPcmFrameSize * speaker_input_frames_) +
-                 1);
+  chunks.reserve(pcm_bytes.size() / (kPcmFrameSize * pcm_window_frames_) + 1);
 
   const auto consume_frame = [this, &chunks](const std::uint8_t *base) {
     std::array<std::int16_t, kPcmChannels> samples{};
@@ -1340,24 +1643,24 @@ PcmAudioExtractor::push_usb_audio(std::span<const std::uint8_t> pcm_bytes) {
       chunk_has_signal_ |= samples[channel] != 0;
     }
 
-    speaker_input_[speaker_frame_pos_ * kSpeakerChannels + 0] = samples[0];
-    speaker_input_[speaker_frame_pos_ * kSpeakerChannels + 1] = samples[1];
-    haptics_input_[speaker_frame_pos_ * kSpeakerChannels + 0] = samples[2];
-    haptics_input_[speaker_frame_pos_ * kSpeakerChannels + 1] = samples[3];
+    speaker_pcm_[pcm_window_frame_pos_ * kSpeakerChannels + 0] = samples[0];
+    speaker_pcm_[pcm_window_frame_pos_ * kSpeakerChannels + 1] = samples[1];
+    haptics_pcm_[pcm_window_frame_pos_ * kSpeakerChannels + 0] = samples[2];
+    haptics_pcm_[pcm_window_frame_pos_ * kSpeakerChannels + 1] = samples[3];
     chunk_has_haptics_signal_ |= samples[2] != 0 || samples[3] != 0;
     chunk_has_speaker_signal_ |= samples[0] != 0 || samples[1] != 0;
-    ++speaker_frame_pos_;
+    ++pcm_window_frame_pos_;
 
-    if (speaker_frame_pos_ != speaker_input_frames_) {
+    if (pcm_window_frame_pos_ != pcm_window_frames_) {
       return;
     }
 
-    speaker_frame_pos_ = 0;
+    pcm_window_frame_pos_ = 0;
     AudioChunk chunk{};
     chunk.haptics = haptics_resampler_.process(std::span<const std::int16_t>(
-        haptics_input_.data(), speaker_input_frames_ * kSpeakerChannels));
+        haptics_pcm_.data(), pcm_window_frames_ * kSpeakerChannels));
     chunk.speaker = speaker_encoder_->encode(std::span<std::int16_t>(
-        speaker_input_.data(), speaker_input_frames_ * kSpeakerChannels));
+        speaker_pcm_.data(), pcm_window_frames_ * kSpeakerChannels));
     chunk.has_signal = chunk_has_signal_;
     chunk.has_haptics_signal = chunk_has_haptics_signal_;
     chunk.has_speaker_signal = chunk_has_speaker_signal_;
@@ -1421,6 +1724,8 @@ std::string frame_type_name(std::uint16_t type) {
     return "USB_FEATURE_SET";
   case VDS_FRAME_USB_AUDIO_OUT:
     return "USB_AUDIO_OUT";
+  case VDS_FRAME_USB_AUDIO_IN:
+    return "USB_AUDIO_IN";
   case VDS_FRAME_USB_HID_IN:
     return "USB_HID_IN";
   case VDS_FRAME_USB_FEATURE_REPLY:

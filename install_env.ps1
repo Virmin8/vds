@@ -11,7 +11,7 @@ function Test-VdsElevated {
   $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
   return $Principal.IsInRole(
-  [Security.Principal.WindowsBuiltInRole]::Administrator
+    [Security.Principal.WindowsBuiltInRole]::Administrator
   )
 }
 
@@ -45,9 +45,9 @@ function Test-VdsPathListContains {
   $NormalizedPath = $Path.TrimEnd("\")
   foreach ($Entry in $Entries) {
     if ($Entry.TrimEnd("\").Equals(
-    $NormalizedPath,
-    [System.StringComparison]::OrdinalIgnoreCase
-    )) {
+        $NormalizedPath,
+        [System.StringComparison]::OrdinalIgnoreCase
+      )) {
       return $true
     }
   }
@@ -77,9 +77,9 @@ $Entries = @(Split-VdsPathList -Value $PathValue)
 if (!(Test-VdsPathListContains -Entries $Entries -Path $ResolvedPath)) {
   $Entries += $ResolvedPath
   [System.Environment]::SetEnvironmentVariable(
-  "Path",
-  (Join-VdsPathList -Entries $Entries),
-  $Target
+    "Path",
+    (Join-VdsPathList -Entries $Entries),
+    $Target
   )
 }
 

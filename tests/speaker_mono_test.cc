@@ -13,9 +13,9 @@ namespace {
 // One 512-frame window of 4-channel PCM: a different tone on each speaker
 // channel (so the encoder would choose stereo if allowed), silent haptics.
 std::vector<std::uint8_t> window(std::size_t index) {
-  std::vector<std::uint8_t> pcm(vds::kSpeakerInputFrames * VDS_AUDIO_CHANNELS * 2);
-  for (std::size_t f = 0; f < vds::kSpeakerInputFrames; ++f) {
-    const double t = static_cast<double>(index * vds::kSpeakerInputFrames + f) / 48000.0;
+  std::vector<std::uint8_t> pcm(vds::kPcmWindowFrames * VDS_AUDIO_CHANNELS * 2);
+  for (std::size_t f = 0; f < vds::kPcmWindowFrames; ++f) {
+    const double t = static_cast<double>(index * vds::kPcmWindowFrames + f) / 48000.0;
     const std::int16_t left = static_cast<std::int16_t>(8000 * std::sin(2 * 3.14159265 * 440 * t));
     const std::int16_t right = static_cast<std::int16_t>(8000 * std::sin(2 * 3.14159265 * 660 * t));
     for (const auto [channel, value] : {std::pair{0, left}, std::pair{1, right}}) {

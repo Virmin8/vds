@@ -513,7 +513,7 @@ std::uint8_t apply_command(CompanionRuntime &runtime,
     settings.touchpad_pointer_enabled = value != 0;
     return kAckOk;
   default:
-    logger.log("companion", LogLevel::Warn,
+    logger.log(vds::LogScope::Companion, LogLevel::Warn,
                "unknown companion command id " + std::to_string(command_id));
     return kAckErrUnknownCommand;
   }

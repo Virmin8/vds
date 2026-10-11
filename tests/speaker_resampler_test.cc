@@ -79,7 +79,7 @@ int main() {
   // 512 -> 480: audible tones come through accurately, including across the
   // joins between windows (any discontinuity would show up as error).
   for (const double hz : {100.0, 1000.0, 5000.0, 12000.0, 17000.0}) {
-    const auto result = run_tone(vds::kSpeakerInputFrames, hz);
+    const auto result = run_tone(vds::kPcmWindowFrames, hz);
     std::printf("%6.0f Hz: max error %.2f%%\n", hz,
                 100.0 * result.max_error / kAmplitude);
     assert(result.max_error < 0.01 * kAmplitude);
@@ -88,7 +88,7 @@ int main() {
   // Content above the output Nyquist (22.5 kHz relative to the input clock)
   // is removed instead of folding back as audible aliasing.
   for (const double hz : {22800.0, 23500.0}) {
-    const auto result = run_tone(vds::kSpeakerInputFrames, hz);
+    const auto result = run_tone(vds::kPcmWindowFrames, hz);
     const double db = 20.0 * std::log10(result.rms / (kAmplitude / std::sqrt(2.0)));
     std::printf("%6.0f Hz: %.1f dB\n", hz, db);
     assert(db < -40.0);
@@ -96,8 +96,8 @@ int main() {
 
   // Silence stays silent.
   {
-    vds::SpeakerResampler resampler(vds::kSpeakerInputFrames);
-    std::vector<std::int16_t> window(vds::kSpeakerInputFrames * 2, 0);
+    vds::SpeakerResampler resampler(vds::kPcmWindowFrames);
+    std::vector<std::int16_t> window(vds::kPcmWindowFrames * 2, 0);
     const auto out = resampler.process(window);
     assert(std::all_of(out.begin(), out.end(),
                        [](std::int16_t s) { return s == 0; }));

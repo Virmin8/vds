@@ -58,7 +58,9 @@ target_include_directories(jsonl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 if(WIN32)
   add_library(vds_win32 OBJECT src/platform/win32/vds_win32.cc)
-  target_include_directories(vds_win32 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_include_directories(
+    vds_win32 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
   add_library(vds_io OBJECT src/platform/win32/vds_io.cc)
   target_include_directories(vds_io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -98,7 +100,20 @@ if(WIN32)
   target_include_directories(vds_bt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                                            ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(vds_bt PUBLIC vds_protocol vds_common vds_io hid
-                                      setupapi bthprops)
+                                      setupapi bthprops cfgmgr32)
+
+  add_library(vds_hidhide OBJECT src/platform/win32/vds_hidhide.cc)
+  target_include_directories(
+    vds_hidhide PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                       ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(vds_hidhide PUBLIC vds_log vds_win32)
+
+  add_library(vds_usbip OBJECT src/platform/win32/vds_usbip.cc)
+  target_include_directories(
+    vds_usbip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(vds_usbip PUBLIC vds_protocol vds_io vds_log vds_win32
+                                        ws2_32 winmm)
 
   add_executable(vdsd src/platform/win32/vdsd.cc)
   add_dependencies(vdsd vds_build_info_header)
@@ -110,8 +125,10 @@ if(WIN32)
             vds_bt
             vds_common
             vds_config
+            vds_hidhide
             vds_log
             vds_io
+            vds_usbip
             vds_win32
             vdsd_common
             winmm)
@@ -124,10 +141,8 @@ if(WIN32)
     vdsctl
     PRIVATE vds_protocol
             jsonl
-            vds_bt
             vds_common
             vds_config
-            vds_io
             vds_win32
             vdsctl_common
             advapi32)
@@ -221,6 +236,8 @@ if(WIN32)
   set(VDS_RUNTIME_INSTALL_DIR ".")
   set(VDS_INSTALLED_VDSD "${CMAKE_INSTALL_PREFIX}/vdsd.exe")
   set(VDS_INSTALLED_VDSCTL "${CMAKE_INSTALL_PREFIX}/vdsctl.exe")
+  set(VDS_INSTALLED_OPUS
+      "${CMAKE_INSTALL_PREFIX}/$<TARGET_FILE_NAME:${VDS_OPUS_TARGET}>")
   set(VDS_POWERSHELL powershell.exe)
   set(VDS_STOP_SERVICE_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/stop_service.ps1)
   set(VDS_INSTALL_SERVICE_SCRIPT
@@ -317,6 +334,10 @@ if(WIN32 AND INSTALL_SERVICE)
 endif()
 
 install(TARGETS vdsd vdsctl RUNTIME DESTINATION ${VDS_RUNTIME_INSTALL_DIR})
+if(WIN32)
+  install(FILES "$<TARGET_FILE:${VDS_OPUS_TARGET}>"
+          DESTINATION ${VDS_RUNTIME_INSTALL_DIR})
+endif()
 
 if(WIN32)
   if(INSTALL_SERVICE)
@@ -327,11 +348,11 @@ if(WIN32)
         ${VDS_POWERSHELL} ${VDS_POWERSHELL_ARGS} ${VDS_UNINSTALL_SERVICE_SCRIPT}
         -ServiceName vdsd ${VDS_UNINSTALL_SERVICE_STOP_ARG}
       COMMAND ${CMAKE_COMMAND} -E rm -f ${VDS_INSTALLED_VDSD}
-              ${VDS_INSTALLED_VDSCTL})
+              ${VDS_INSTALLED_VDSCTL} ${VDS_INSTALLED_OPUS})
   else()
     add_custom_target(
       uninstall COMMAND ${CMAKE_COMMAND} -E rm -f ${VDS_INSTALLED_VDSD}
-                        ${VDS_INSTALLED_VDSCTL})
+                        ${VDS_INSTALLED_VDSCTL} ${VDS_INSTALLED_OPUS})
   endif()
 else()
   if(INSTALL_SERVICE)

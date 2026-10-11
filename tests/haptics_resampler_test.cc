@@ -12,7 +12,7 @@
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr std::size_t kWindow = vds::kSpeakerInputFrames; // 512 -> 32
+constexpr std::size_t kWindow = vds::kPcmWindowFrames; // 512 -> 32
 constexpr std::size_t kBlocks = 100;                      // ~1 s
 constexpr std::size_t kSkipBlocks = 2;                    // filter warm-up
 

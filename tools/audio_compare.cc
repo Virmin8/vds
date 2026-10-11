@@ -31,7 +31,7 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr int kRate = 48000;
-constexpr std::size_t kWindow = vds::kSpeakerInputFrames;     // 512
+constexpr std::size_t kWindow = vds::kPcmWindowFrames;     // 512
 constexpr std::size_t kOpusFrames = vds::kSpeakerOpusFrames;  // 480
 constexpr std::size_t kHapticFrames = vds::kHapticsFrames;    // 32
 constexpr std::size_t kSectionFrames = 3 * kRate;

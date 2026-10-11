@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "unique_fd.hh"
-#include "vds_protocol.hh"
 
 namespace vds {
 
@@ -56,7 +55,7 @@ public:
   void send_feature_get(std::uint8_t report_id);
   void send_feature_set(std::span<const std::uint8_t> report);
   std::optional<std::vector<std::uint8_t>> read_feature_report();
-  std::optional<UsbInputReport> read_input_report();
+  std::optional<std::vector<std::uint8_t>> read_interrupt_packet();
 
 private:
   std::string address_;

@@ -2,12 +2,20 @@
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
 
 #include <algorithm>
+#include <filesystem>
 #include <ostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "jsonl.hh"
 #include "vds_companion.hh"
@@ -17,16 +25,48 @@
 
 namespace vds {
 
+namespace {
+
+#ifdef _WIN32
+std::string windows_program_data_file(std::string_view filename) {
+  const DWORD required = GetEnvironmentVariableA("ProgramData", nullptr, 0);
+  if (required == 0) {
+    throw std::runtime_error("ProgramData is not available");
+  }
+
+  std::string program_data(required, '\0');
+  const DWORD length =
+      GetEnvironmentVariableA("ProgramData", program_data.data(), required);
+  if (length == 0 || length >= required) {
+    throw std::runtime_error("ProgramData is not available");
+  }
+  program_data.resize(length);
+
+  return (std::filesystem::path(program_data) / "vDS" / filename).string();
+}
+#endif
+
+} // namespace
+
 VdsdCommonOptions default_vdsd_common_options() {
+#ifdef _WIN32
   return VdsdCommonOptions{
-      .db_path = kDefaultDbPath,
-      .log_path = kDefaultLogPath,
+      .db_path = windows_program_data_file("vdsd.db"),
+      .log_path = windows_program_data_file("vdsd.log"),
       .help_requested = false,
   };
+#else
+  return VdsdCommonOptions{
+      .db_path = "/var/lib/vds/vdsd.db",
+      .log_path = "/var/log/vdsd.log",
+      .help_requested = false,
+  };
+#endif
 }
 
 std::string vdsd_usage(std::string_view version, std::string_view build_year,
                        std::string_view platform_options) {
+  const VdsdCommonOptions defaults = default_vdsd_common_options();
   std::string text = "vdsd (";
   text += version;
   text += "): vDS daemon - Copyright (C) ";
@@ -34,9 +74,9 @@ std::string vdsd_usage(std::string_view version, std::string_view build_year,
   text += " Jihong Min\n"
           "usage:\n"
           "  vdsd [--db-path ";
-  text += kDefaultDbPath;
+  text += defaults.db_path;
   text += "] [--log ";
-  text += kDefaultLogPath;
+  text += defaults.log_path;
   text += "]";
   if (!platform_options.empty()) {
     text += " ";
@@ -90,13 +130,21 @@ std::uint32_t parse_trace_scope(std::string_view scope) {
   while (true) {
     const std::size_t separator = scope.find(',');
     const std::string_view item = scope.substr(0, separator);
-    if (item == "input") {
+    if (item == "input" || item == "all") {
       flags |= kTraceInput;
+      if (item == "all") {
+        flags |= kTraceOutput;
+      }
+    } else if (item == "input-audio") {
+      flags |= kTraceInputAudio;
+    } else if (item == "input-control") {
+      flags |= kTraceInputControl;
     } else if (item == "output") {
       flags |= kTraceOutput;
     } else {
       throw std::runtime_error(
-          "trace scope must be input, output, or comma-separated input/output");
+          "trace scope must be all, input, input-audio, input-control, output, "
+          "or comma-separated scopes");
     }
     if (separator == std::string_view::npos) {
       return flags;
@@ -112,10 +160,32 @@ std::string trace_scope_name(std::uint32_t scope) {
   if (scope == kTraceInput) {
     return "input";
   }
+  if (scope == kTraceInputAudio) {
+    return "input-audio";
+  }
+  if (scope == kTraceInputControl) {
+    return "input-control";
+  }
   if (scope == kTraceOutput) {
     return "output";
   }
-  return "none";
+  std::string name;
+  if (trace_enabled(scope, kTraceInputAudio)) {
+    name += "input-audio";
+  }
+  if (trace_enabled(scope, kTraceInputControl)) {
+    if (!name.empty()) {
+      name += ',';
+    }
+    name += "input-control";
+  }
+  if (trace_enabled(scope, kTraceOutput)) {
+    if (!name.empty()) {
+      name += ',';
+    }
+    name += "output";
+  }
+  return name.empty() ? "none" : name;
 }
 
 std::string format_controller_config(const ControllerConfig &config) {
@@ -438,8 +508,15 @@ std::string format_control_trace_reply(bool ok, std::string_view error,
   reply += jsonl_bool_field("trace", (trace_flags & kTraceAll) != 0);
   reply += ",\"scope\":[";
   bool wrote_scope = false;
-  if (trace_enabled(trace_flags, kTraceInput)) {
-    reply += jsonl_string_value("input");
+  if (trace_enabled(trace_flags, kTraceInputAudio)) {
+    reply += jsonl_string_value("input-audio");
+    wrote_scope = true;
+  }
+  if (trace_enabled(trace_flags, kTraceInputControl)) {
+    if (wrote_scope) {
+      reply += ',';
+    }
+    reply += jsonl_string_value("input-control");
     wrote_scope = true;
   }
   if (trace_enabled(trace_flags, kTraceOutput)) {
@@ -483,7 +560,7 @@ std::string handle_attach_control_request(
 
     if (!config.address.empty()) {
       const std::string error = "address is already registered";
-      logger.log("control", LogLevel::Warn,
+      logger.log(vds::LogScope::Control, LogLevel::Warn,
                  "attach rejected " + error + ": " + config.address);
       return format_control_attach_reply(false, error, config);
     }
@@ -498,7 +575,8 @@ std::string handle_attach_control_request(
       const std::string error =
           "address is not paired, not supported, or not attachable; run "
           "vdsctl list-targets";
-      logger.log("control", LogLevel::Warn, "attach rejected " + error);
+      logger.log(vds::LogScope::Control, LogLevel::Warn,
+                 "attach rejected " + error);
       config = {};
       return format_control_attach_reply(false, error, config);
     }
@@ -517,7 +595,7 @@ std::string handle_attach_control_request(
     });
     if (already_registered) {
       const std::string error = "address is already registered";
-      logger.log("control", LogLevel::Warn,
+      logger.log(vds::LogScope::Control, LogLevel::Warn,
                  "attach rejected " + error + ": " + config.address);
       return format_control_attach_reply(false, error, config);
     }
@@ -526,7 +604,7 @@ std::string handle_attach_control_request(
   }
 
   reload_requested = true;
-  logger.log("control", LogLevel::Info,
+  logger.log(vds::LogScope::Control, LogLevel::Info,
              "attached controller config " + format_controller_config(config));
   return format_control_attach_reply(true, "", config);
 }
@@ -563,7 +641,7 @@ std::string handle_detach_control_request(std::span<const JsonlField> fields,
     return format_control_detach_reply(false, error.what(), address);
   }
   reload_requested = removed;
-  logger.log("control", LogLevel::Info,
+  logger.log(vds::LogScope::Control, LogLevel::Info,
              std::string(removed ? "detached " : "detach ignored ") + address);
 
   if (!removed) {
@@ -624,7 +702,7 @@ std::string handle_trace_control_request(std::span<const JsonlField> fields,
     return format_control_trace_reply(false, error.what(), trace_flags);
   }
 
-  logger.log("control", LogLevel::Info,
+  logger.log(vds::LogScope::Control, LogLevel::Info,
              "trace " + trace_scope_name(scope) + " " +
                  (enabled ? "enabled" : "disabled") +
                  " active=" + active_trace_name(trace_flags));
@@ -665,7 +743,7 @@ std::string handle_vdsd_control_command(
                                               controllers, logger);
     }
 
-    logger.log("control", LogLevel::Warn,
+    logger.log(vds::LogScope::Control, LogLevel::Warn,
                "unknown command: " + std::string(command));
     return format_control_error_reply("unknown command: " + command);
   } catch (const std::exception &error) {

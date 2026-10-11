@@ -31,9 +31,6 @@ Application
   -(Bluetooth HID Control/Interrupt)-> DualSense (Edge) controller
 ```
 
-The future goal is to remove userspace from runtime communication where possible
-and reduce overhead.
-
 The virtual USB HID endpoint descriptors match each controller's USB HID
 specification: DualSense HID IN/OUT use 4 ms intervals, while DualSense Edge HID
 IN uses 1 ms and HID OUT uses 4 ms. vDS uses the HID IN interval to pace virtual
@@ -212,18 +209,10 @@ Set the `pro-audio` profile:
 wpctl set-profile <device-id> <pro-audio-profile-index>
 ```
 
-> [!WARNING]
->
-> The microphone/source node is disabled on purpose. vDS currently supports
-> controller speaker and haptics output, but not microphone input. If
-> WirePlumber, games, or tools such as `pavucontrol` open the capture endpoint,
-> the extra USB audio traffic can disrupt controller speaker and haptics output,
-> as well as main audio playback.
-
 After setting the `pro-audio` profile, install the included WirePlumber rule. It
 gives the virtual controller stable display names, sets the output node to 4
-channels, disables channelmix normalization, disables the unsupported microphone
-source node, and lowers its priority:
+channels, disables channelmix normalization, and gives the microphone source a
+low priority:
 
 ```sh
 mkdir -p ~/.config/wireplumber/wireplumber.conf.d
