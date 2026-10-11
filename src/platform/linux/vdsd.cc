@@ -798,7 +798,7 @@ void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
 }
 
 // Opens or closes the controller mic so it follows the host's capture stream
-// while the mic is allowed, and pushes mic mute (and the mute LED) to it.
+// while the mic is on, and pushes mic mute (and the mute light) to it.
 // Callers forward the 0x31 state afterwards for the LED when the mic is shut.
 void sync_port_mic(VirtualPort &port, vds::BtL2capBackend *bt_backend,
                    vds::Logger &logger) {
@@ -823,7 +823,8 @@ void sync_port_mic(VirtualPort &port, vds::BtL2capBackend *bt_backend,
                      " sent=" + (sent ? "yes" : "no"));
     }
   }
-  port.output_state.set_mic_mute_led(g_mic_allowed && g_mic_muted);
+  // Mute light on whenever the mic is not live (off or muted), like a PS5.
+  port.output_state.set_mic_mute_led(!(g_mic_allowed && !g_mic_muted));
 }
 
 void handle_frame(const vds_frame_header &header,
@@ -1403,16 +1404,25 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
   bool headset_mic_changed = false;
   bool mic_mute_changed = false;
   bool output_state_changed = false;
-  // Mute toggles mic mute while the mic is on, unless the Mute button mode is
-  // Chord (Mute starts chords); vdsd has no keyboard/quiet modes, so those act
-  // as Normal. The app sees the change through the status report.
+  // Mute switches the mic on/off (pass-through + mute together, like the
+  // app's Microphone switch) unless the Mute button mode is Chord (Mute starts
+  // chords); vdsd has no keyboard/quiet modes, so those act as Normal. The app
+  // follows through the status report (mic muted = mic off).
   constexpr std::uint8_t kMuteButtonModeChord = 3;
-  if (mute_button_down && !port.mute_button_down && g_mic_allowed &&
+  if (mute_button_down && !port.mute_button_down &&
       companion.settings.mute_button_mode != kMuteButtonModeChord) {
-    companion.settings.mic_muted = !companion.settings.mic_muted;
+    const bool mic_on = !(g_mic_allowed && !g_mic_muted);
+    companion.settings.duplex_enabled = mic_on;
+    companion.settings.mic_muted = !mic_on;
     ++companion.settings_revision;
-    g_mic_muted = companion.settings.mic_muted;
+    g_mic_allowed = g_mic_forced || mic_on;
+    g_mic_muted = !mic_on;
     mic_mute_changed = true;
+    // DS5 Bridge MIC_MUTE_ON (0x04) / MIC_MUTE_OFF (0x05) input events.
+    if (companion.pending_input_events.size() <
+        vds::kCompanionMaxPendingInputEvents) {
+      companion.pending_input_events.push_back(mic_on ? 0x05 : 0x04);
+    }
   }
   port.mute_button_down = mute_button_down;
   if (headset_mic_plugged != port.headset_mic_plugged) {
@@ -1425,7 +1435,8 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
                                 "mic mute");
     logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
                port.path + " mic " +
-                   std::string(port.mic_muted ? "muted" : "unmuted"));
+                   std::string(g_mic_allowed && !g_mic_muted ? "on" : "off") +
+                   " (Mute button)");
   } else if (headset_mic_changed && port.audio_in_stream_active) {
     bt_backend.try_send_output_report(
         port.output_state.build_bt_mic_state_report(true, port.mic_muted));

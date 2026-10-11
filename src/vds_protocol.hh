@@ -362,9 +362,8 @@ public:
   void set_audio_out_stream_active(bool active, bool headset_plugged = false);
   void set_companion_overrides(const DsCompanionOverrides &overrides);
   void set_headset_mic_plugged(bool plugged);
-  // The mute LED shows vdsd's mic mute while the mic is enabled and is kept
-  // off otherwise (hid-playstation toggles it on every Mute press, which is
-  // also the shortcut modifier).
+  // The mute LED is vdsd's: on while the mic is off or muted. The host's
+  // requests are ignored (hid-playstation toggles it on every Mute press).
   void set_mic_mute_led(bool on);
   BtStateReport build_bt_mic_state_report(bool active, bool muted);
   BtInitReport build_bt_mic_report(bool active, std::uint8_t buffer_length = 64);
