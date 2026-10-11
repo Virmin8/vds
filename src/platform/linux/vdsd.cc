@@ -822,12 +822,13 @@ void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
   }
 }
 
-// Opens or closes the controller mic so it follows the host's capture stream
-// while the mic is on, and pushes mic mute (and the mute light) to it.
-// Callers forward the 0x31 state afterwards for the LED when the mic is shut.
+// Keeps the controller mic open for as long as the mic is on (switch on and
+// not muted), so a recording starts without the controller's warm-up; its
+// audio is forwarded only while the host records. Also pushes mic mute (and
+// the mute light). Callers forward the 0x31 state afterwards for the LED.
 void sync_port_mic(VirtualPort &port, vds::BtL2capBackend *bt_backend,
                    vds::Logger &logger) {
-  const bool open = g_mic_allowed && port.audio_in_requested;
+  const bool open = g_mic_allowed && !g_mic_muted;
   const bool open_changed = open != port.audio_in_stream_active;
   const bool mute_changed = g_mic_muted != port.mic_muted;
   port.mic_muted = g_mic_muted;
@@ -1352,6 +1353,9 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
       }
       port.trace_state.mic_last_decoded_bytes =
           static_cast<std::uint16_t>(pcm.size());
+      if (!port.audio_in_requested) {
+        return true; // mic kept ready; nothing is recording
+      }
       const auto frame = vds::frame_bytes(VDS_FRAME_USB_AUDIO_IN, pcm);
       const bool wrote =
           write_vds_frame(port, frame, input_audio_trace, logger);
@@ -1930,6 +1934,8 @@ void complete_pending_controller(ControllerRuntime &controller,
   ioctl_noarg(port.fd.get(), VDS_IOC_CONNECT, "VDS_IOC_CONNECT");
   controller.virtual_connected = true;
   controller.last_error.clear();
+  // Mic on: open the controller mic now so it is ready before any recording.
+  sync_port_mic(port, &*controller.backend, logger);
 
   logger.log(
       vds::LogScope::Bluetooth, vds::LogLevel::Info,
