@@ -333,9 +333,9 @@ struct DsCompanionOverrides {
   std::uint16_t speaker_volume_percent = 100;
   std::uint8_t speaker_gain_level = 1;
   // While the controller mic is open: its processing (bit 0 noise cancel,
-  // bit 1 echo cancel; the default is noise cancel) and the speaker preamp
-  // gain (0 keeps speaker_gain_level).
-  std::uint8_t mic_processing = kMicProcessingNoiseCancel;
+  // bit 1 echo cancel; the default is echo cancel: noise cancel distorts the
+  // speaker) and the speaker preamp gain (0 keeps speaker_gain_level).
+  std::uint8_t mic_processing = kMicProcessingEchoCancel;
   std::uint8_t mic_speaker_gain_level = 0;
 };
 
@@ -417,6 +417,10 @@ private:
   bool audio_out_headset_ = false;
   bool mic_stream_active_ = false;
   bool mic_mute_led_ = false;
+  // Set by the first mic state report: from then on the effective state keeps
+  // the controller mic muted unless it is open and unmuted.
+  bool mic_state_owned_ = false;
+  bool mic_hw_muted_ = true;
   // Audio control byte while the mic is open: the host's mic select with the
   // companion's processing bits.
   std::uint8_t mic_audio_control() const;

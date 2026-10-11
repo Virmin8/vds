@@ -53,7 +53,7 @@ struct CompanionSettings {
   // Linux-port extensions while the mic is open: processing (0x44; bit 0
   // noise cancel, bit 1 echo cancel) and speaker gain (0x45; 0 = the speaker
   // gain level).
-  std::uint8_t mic_processing = 1;
+  std::uint8_t mic_processing = 2; // echo cancel
   std::uint8_t mic_speaker_gain_level = 0;
   std::uint8_t mute_button_mode = 0;
   std::uint8_t mute_keyboard_usage = 0;

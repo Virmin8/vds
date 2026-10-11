@@ -74,11 +74,13 @@ int main() {
   state.set_mic_mute_led(false);
   assert(state.state()[8] == 0);
 
-  // While the mic is open: companion mic processing bits (default noise
-  // cancel) and the separate speaker gain; closing restores both.
+  // While the mic is open: companion mic processing bits and the separate
+  // speaker gain; closing restores both.
   {
     vds::DsOutputState mic_state;
     vds::DsCompanionOverrides mic_overrides;
+    assert(mic_overrides.mic_processing == vds::kMicProcessingEchoCancel);
+    mic_overrides.mic_processing = vds::kMicProcessingNoiseCancel;
     mic_overrides.speaker_gain_level = 3;
     mic_state.set_companion_overrides(mic_overrides);
     mic_state.set_audio_out_stream_active(true);
@@ -94,7 +96,27 @@ int main() {
     mic_overrides.mic_processing = 0;
     mic_state.set_companion_overrides(mic_overrides);
     assert((mic_state.state()[7] & 0x0c) == 0);
+    // hid-playstation's mic mute (power save bit 0x10) and mic volume 0 do
+    // not reach the controller while the mic is open; closed, it is muted.
+    std::array<std::uint8_t, 1 + VDS_SET_STATE_SIZE> host_mute{};
+    host_mute[0] = VDS_USB_OUTPUT_REPORT_ID;
+    host_mute[1 + 0] = 0x40;       // allow_mic_volume
+    host_mute[1 + 1] = 0x02;       // allow_audio_mute
+    host_mute[1 + 6] = 0x00;       // mic volume 0
+    host_mute[1 + 9] = 0x10;       // mic mute
+    assert(mic_state.apply_usb_output_report(host_mute));
+    assert((mic_state.state()[9] & 0x10) == 0);
+    mic_state.set_audio_out_stream_active(false);
+    mic_overrides.mic_processing = vds::kMicProcessingNoiseCancel;
+    mic_state.set_companion_overrides(mic_overrides);
+    assert((mic_state.state()[7] & 0x0c) == 0x08);
+    mic_overrides.mic_processing = 0;
+    mic_state.set_companion_overrides(mic_overrides);
+    mic_state.set_audio_out_stream_active(true);
+    assert((mic_state.state()[1] & 0x02) != 0);
+    assert(mic_state.state()[6] != 0);
     (void)mic_state.build_bt_mic_state_report(false, true);
+    assert((mic_state.state()[9] & 0x10) != 0);
     assert((mic_state.state()[7] & 0x3f) == 0x30);
     assert((mic_state.state()[37] & 0x07) == 3);
   }

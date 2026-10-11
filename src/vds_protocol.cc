@@ -1114,6 +1114,34 @@ void DsOutputState::recompute_effective_state() {
   effective_state_[kOutputFlag1Offset] |= kOutputFlag1MicMuteLedControlEnable;
   effective_state_[kOutputMuteLedOffset] = mic_mute_led_ ? 1 : 0;
 
+  // Once vdsd drives the mic, it owns the controller's mic mute and volume:
+  // hid-playstation's output (at probe and on every Mute press) carries its
+  // own mic mute, which would silence an open mic.
+  if (mic_state_owned_) {
+    effective_state_[kOutputFlag1Offset] |= kOutputFlag1PowerSaveControlEnable;
+    effective_state_[kOutputPowerSaveControlOffset] =
+        mic_hw_muted_
+            ? static_cast<std::uint8_t>(
+                  effective_state_[kOutputPowerSaveControlOffset] |
+                  kOutputPowerSaveMicMute)
+            : static_cast<std::uint8_t>(
+                  effective_state_[kOutputPowerSaveControlOffset] &
+                  ~kOutputPowerSaveMicMute);
+    if (mic_stream_active_) {
+      // Companion mic processing, also when no speaker stream carries it.
+      effective_state_[kOutputFlag0Offset] |= kOutputFlag0AudioControlEnable;
+      effective_state_[kOutputAudioControlOffset] =
+          audio_control_with_output_path(
+              mic_audio_control(),
+              effective_state_[kOutputAudioControlOffset] & kOutputPathMask);
+    }
+    if (!mic_hw_muted_) {
+      effective_state_[kOutputFlag0Offset] |= kOutputFlag0MicVolumeEnable;
+      effective_state_[kOutputMicVolumeOffset] =
+          mic_volume_ != 0 ? mic_volume_ : kOutputMicVolumeDefault;
+    }
+  }
+
   if (!companion_.player_led_enabled) {
     set_state_bit(effective_state_[1], 4, true); // allow_player_indicators
     effective_state_[kOutputLedColorOffset - 1] = 0;
@@ -1462,10 +1490,14 @@ BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
                                 kOutputFlag1AudioControl2Enable;
   const std::uint8_t audio_control = audio_control_with_output_path(
       active ? mic_audio_control() : audio_control_, audio_output_path_);
-  state_[kOutputMicVolumeOffset] = active && !muted ? mic_volume_ : 0;
+  state_[kOutputMicVolumeOffset] = active && !muted
+          ? (mic_volume_ != 0 ? mic_volume_ : kOutputMicVolumeDefault)
+          : 0;
   state_[kOutputAudioControlOffset] = audio_control;
   state_[kOutputAudioControl2Offset] = audio_control2_;
   mic_mute_led_ = muted;
+  mic_state_owned_ = true;
+  mic_hw_muted_ = !active || muted;
   state_[kOutputMuteLedOffset] = muted ? 1 : 0;
   state_[kOutputPowerSaveControlOffset] = power_save_control;
   mic_stream_active_ = active;
@@ -1482,7 +1514,9 @@ BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
       kOutputFlag1MicMuteLedControlEnable | kOutputFlag1PowerSaveControlEnable |
       kOutputFlag1AudioControl2Enable;
   report[kBtStateOffset + kOutputMicVolumeOffset] =
-      active && !muted ? mic_volume_ : 0;
+      active && !muted
+          ? (mic_volume_ != 0 ? mic_volume_ : kOutputMicVolumeDefault)
+          : 0;
   report[kBtStateOffset + kOutputAudioControlOffset] = audio_control;
   report[kBtStateOffset + kOutputMuteLedOffset] = muted ? 1 : 0;
   report[kBtStateOffset + kOutputPowerSaveControlOffset] = power_save_control;
