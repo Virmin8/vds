@@ -357,7 +357,7 @@ public:
   void set_companion_overrides(const DsCompanionOverrides &overrides);
   void set_headset_mic_plugged(bool plugged);
   BtStateReport build_bt_mic_state_report(bool active, bool muted);
-  BtInitReport build_bt_mic_report(bool active);
+  BtInitReport build_bt_mic_report(bool active, std::uint8_t buffer_length = 64);
   BtInitReport build_bt_init_report();
   BtStateReport build_bt_state_report();
   const DsState &state() const { return effective_state_; }

@@ -128,6 +128,9 @@ constexpr std::size_t kMaxPendingAudioChunks = 8;
  * the silence, so it resumes cleanly.
  */
 constexpr std::size_t kHapticsOnlyAfterSilentPackets = 94;
+// Controller audio buffer (3 kHz samples) used while the mic records; the
+// value upstream sends with the mic.
+constexpr std::uint8_t kMicBufferLength = 64;
 constexpr std::uint8_t kTestCommandReportId = 0x80;
 constexpr std::uint8_t kTestCommandResultReportId = 0x81;
 constexpr std::uint8_t kTestCommandCompleteStatus = 0x02;
@@ -825,7 +828,9 @@ void handle_frame(const vds_frame_header &header,
             port.audio_in_stream_active, port.mic_muted);
         bt_backend->try_send_output_report(state_report);
         const auto report =
-            port.output_state.build_bt_mic_report(port.audio_in_stream_active);
+            port.output_state.build_bt_mic_report(
+                port.audio_in_stream_active,
+                std::max(port.audio_stats.buffer_length, kMicBufferLength));
         const bool sent = bt_backend->try_send_output_report(report);
         if (trace_enabled(trace_flags, kTraceInputAudio)) {
           logger.log(
@@ -1270,6 +1275,9 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
   if (!report) {
     // Not controller input or mic audio. Logged without tracing so an
     // unexpected header shows up if input ever stops.
+    if (packet->size() < 2 || (*packet)[1] != VDS_BT_STATE_REPORT_ID) {
+      return true; // e.g. the basic 0x01 report sent once at connect
+    }
     ++port.trace_state.bt_input_unknown_count;
     if (port.trace_state.bt_input_unknown_count == 1 ||
         port.trace_state.bt_input_unknown_count % 1000 == 0) {
@@ -1988,8 +1996,15 @@ bool flush_pending_audio_chunk(VirtualPort &port,
   const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
   const auto &chunk = port.pending_audio_chunks.front();
   // Haptics gain is applied by the extractor before 8-bit quantization.
+  // While the mic records: enable the packets' mic section, keep 0x36 (the
+  // mic is not tested with 0x33), and keep the buffer at least at the mic's
+  // length. Otherwise packets match the pre-mic behavior.
+  const bool mic_open = port.audio_in_stream_active;
+  port.haptics_builder.set_buffer_length(
+      mic_open ? std::max(port.audio_stats.buffer_length, kMicBufferLength)
+               : port.audio_stats.buffer_length);
   const bool haptics_only =
-      !port.speaker_waveout_active &&
+      !mic_open && !port.speaker_waveout_active &&
       port.silent_speaker_packets >= kHapticsOnlyAfterSilentPackets &&
       !chunk.has_speaker_signal;
   const auto send_start = Clock::now();
@@ -1997,10 +2012,10 @@ bool flush_pending_audio_chunk(VirtualPort &port,
       haptics_only
           ? bt_backend.try_send_output_report(
                 port.haptics_builder.build_haptics_only_packet(
-                    chunk.haptics, port.output_state.state(), true,
+                    chunk.haptics, port.output_state.state(), mic_open,
                     port.headset_plugged))
           : bt_backend.try_send_output_report(port.haptics_builder.build_packet(
-                chunk.haptics, chunk.speaker, port.output_state.state(), true,
+                chunk.haptics, chunk.speaker, port.output_state.state(), mic_open,
                 port.headset_plugged));
   if (!sent) {
     ++port.trace_state.dropped_audio_haptics_count;

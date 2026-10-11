@@ -41,7 +41,6 @@ constexpr std::size_t kSpeakerDataOffset = 144;
 constexpr std::uint8_t kSpeakerBlockControllerSpeaker = 0x13;
 constexpr std::uint8_t kSpeakerBlockHeadphones = 0x16;
 constexpr int kSpeakerOpusBitrate = kSpeakerOpusSize * 8 * 100;
-constexpr std::uint8_t kBtAudioBufferLength = 64;
 constexpr std::size_t kOutputFlag0Offset = 0;
 constexpr std::size_t kOutputFlag1Offset = 1;
 constexpr std::size_t kOutputHeadphoneVolumeOffset = 4;
@@ -1440,18 +1439,19 @@ BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
   return report;
 }
 
-BtInitReport DsOutputState::build_bt_mic_report(bool active) {
+BtInitReport DsOutputState::build_bt_mic_report(bool active,
+                                                std::uint8_t buffer_length) {
   BtInitReport report{};
   report[0] = kBtMicReportId;
   report[1] = mic_sequence_ << 4;
   report[2] = 0x91;
   report[3] = 0x07;
   report[4] = active ? kBtMicOpen : kBtMicClose;
-  report[5] = kBtAudioBufferLength;
-  report[6] = kBtAudioBufferLength;
-  report[7] = kBtAudioBufferLength;
-  report[8] = kBtAudioBufferLength;
-  report[9] = kBtAudioBufferLength;
+  report[5] = buffer_length;
+  report[6] = buffer_length;
+  report[7] = buffer_length;
+  report[8] = buffer_length;
+  report[9] = buffer_length;
   report[10] = mic_sequence_;
   report[11] = 0x92;
   report[12] = 0x40;
