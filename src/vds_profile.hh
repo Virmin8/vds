@@ -33,7 +33,16 @@ usb_profile_from_controller_profile(ControllerProfile profile) {
 }
 
 inline std::string usb_profile_name(std::uint32_t profile) {
-  return profile == VDS_PROFILE_DSE ? "dse" : "ds5";
+  switch (profile) {
+  case VDS_PROFILE_DSE:
+    return "dse";
+  case VDS_PROFILE_DS4:
+    return "ds4";
+  case VDS_PROFILE_X360:
+    return "x360";
+  default:
+    return "ds5";
+  }
 }
 
 inline std::optional<unsigned int> parse_hex_token(std::string_view text,

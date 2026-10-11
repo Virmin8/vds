@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -392,14 +393,20 @@ std::uint32_t resolve_virtual_port_profile(const vds::ControllerConfig &config,
  * vds_bridge under it (as the Linux event loop does on one thread).
  */
 std::mutex g_bridge_mutex;
-// usbip has no DualShock 4 or Xbox 360 descriptors yet, so Windows offers
-// only the DualSense persona.
+// DualSense, Xbox 360 and DualShock 4 (host_persona_from_value 0, 1, 2): the
+// USB/IP port serves each persona's descriptors.
 vds::CompanionRuntime make_windows_companion_runtime() {
   vds::CompanionRuntime runtime;
-  runtime.supported_host_persona_mask = 1u << 0;
+  runtime.supported_host_persona_mask = (1u << 0) | (1u << 1) | (1u << 2);
   return runtime;
 }
 vds::CompanionRuntime g_companion = make_windows_companion_runtime();
+
+// The persona chosen in the companion app. Caller holds g_bridge_mutex.
+vds::HostPersona companion_host_persona() {
+  return vds::host_persona_from_value(g_companion.settings.host_persona_mode)
+      .value_or(vds::HostPersona::DualSense);
+}
 
 // vds_bridge's view of the HID Bluetooth transport. Writes go through the
 // transport's output queue; feature reports are read directly.
@@ -471,6 +478,11 @@ struct BridgeSession {
   WinBridgeBluetooth *bt = nullptr;
   // Wakes the audio thread to re-check its schedule (new audio, settings).
   HANDLE audio_wake = nullptr;
+  // Ends the session so its worker reopens it with another persona's USB
+  // device. Call with g_bridge_mutex held (the session is alive while it is
+  // in g_sessions).
+  std::function<void()> request_restart;
+  bool persona_switch_requested = false;
 };
 
 // Sessions with a connected controller; guarded by g_bridge_mutex.
@@ -629,7 +641,9 @@ void audio_loop(BridgeSession &session, vds::Logger &logger,
   }
 }
 
-void run_bridge_session(const std::string &device_address,
+// Returns true when the session ended for a host persona switch, so the
+// caller reopens it right away with the new persona.
+bool run_bridge_session(const std::string &device_address,
                         const std::string &virtual_device,
                         const vds::ControllerConfig *selected_config,
                         vds::Logger &logger,
@@ -638,12 +652,21 @@ void run_bridge_session(const std::string &device_address,
   if (selected_config == nullptr) {
     throw std::runtime_error("Windows bridge session requires config");
   }
-  const std::uint32_t profile =
+  const std::uint32_t dualsense_profile =
       resolve_virtual_port_profile(*selected_config, logger);
+  vds::HostPersona persona;
+  {
+    std::lock_guard lock(g_bridge_mutex);
+    persona = companion_host_persona();
+  }
+  // The DS4 and Xbox 360 personas present their own USB device.
+  const std::uint32_t profile =
+      vds::usb_profile_for_persona(persona, dualsense_profile);
 
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
              "Windows bridge opening virtual=" + virtual_device +
-                 " device_address=" + device_address);
+                 " device_address=" + device_address +
+                 " profile=" + vds::usb_profile_name(profile));
   std::string discovery_error;
   const auto device =
       find_connected_bluetooth_device(device_address, &discovery_error);
@@ -673,6 +696,11 @@ void run_bridge_session(const std::string &device_address,
   BridgeSession session;
   session.port.path = virtual_device;
   session.port.audio_prime_chunks = kAudioPrimeChunks;
+  session.port.persona = persona;
+  session.request_restart = [&] {
+    request_bridge_restart(virtual_device_handle.get(), bluetooth.get(),
+                           audio_wake.get(), bridge_restart_requested);
+  };
   session.address = vds::normalize_bluetooth_address(selected_config->address);
   session.bt = &bt;
   session.audio_wake = audio_wake.get();
@@ -725,6 +753,11 @@ void run_bridge_session(const std::string &device_address,
         vds::bridge_companion_overrides(g_companion);
     vds::bridge_apply_companion(session.port, g_companion.settings, overrides,
                                 bt, load_trace_flags(trace_flags), logger);
+    // The persona changed while this session was starting.
+    if (companion_host_persona() != persona) {
+      session.persona_switch_requested = true;
+      session.request_restart();
+    }
   }
 
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
@@ -768,6 +801,26 @@ void run_bridge_session(const std::string &device_address,
     std::lock_guard lock(g_bridge_mutex);
     std::erase(g_sessions, &session);
     vds::bridge_on_disconnect(session.port);
+    return session.persona_switch_requested;
+  }
+}
+
+// The host persona changed in the companion app: restart each session whose
+// virtual USB device presents another persona, so it re-enumerates with the
+// new descriptors (Linux re-enumerates the module port the same way).
+void switch_session_personas(vds::Logger &logger) {
+  std::lock_guard lock(g_bridge_mutex);
+  const vds::HostPersona persona = companion_host_persona();
+  for (BridgeSession *session : g_sessions) {
+    if (session->port.persona == persona || session->persona_switch_requested ||
+        !session->request_restart) {
+      continue;
+    }
+    session->persona_switch_requested = true;
+    logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+               "host persona switch address=" + session->address +
+                   ": reopening the virtual controller");
+    session->request_restart();
   }
 }
 
@@ -1343,8 +1396,11 @@ void run_configured_bridge_worker(vds::ControllerConfig config,
     }
     const std::string virtual_device =
         vds::win::usbip::endpoint_for_port(config.ports[0]);
-    run_bridge_session(device_address, virtual_device, &config, logger,
-                       &stop_requested, &trace_flags);
+    // A persona switch ends the session on purpose; reopen it at once.
+    while (run_bridge_session(device_address, virtual_device, &config, logger,
+                              &stop_requested, &trace_flags) &&
+           !g_stop_requested && !stop_requested.load()) {
+    }
     if (!g_stop_requested && !stop_requested.load()) {
       last_error = "bridge session ended";
       logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
@@ -1740,6 +1796,7 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
         trace_flags.store(current_trace_flags);
         return reply;
       });
+      switch_session_personas(logger);
       {
         std::uint64_t version = 0;
         {

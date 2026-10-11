@@ -40,6 +40,7 @@
 #include "audio_thread_priority.hh"
 #include "unique_handle.hh"
 #include "vds/ds5_usb.h"
+#include "vds/persona_usb.h"
 #include "vds_io.hh"
 #include "vds_log.hh"
 #include "vds_win32.hh"
@@ -173,10 +174,10 @@ struct UsbipRetUnlink {
 #pragma pack(pop)
 
 // Endpoint numbers are sourced directly from the shared descriptor table.
+// DualSense / DualSense Edge audio endpoints; the report endpoints are per
+// profile (ProfileDescriptors::report_in_ep / report_out_ep).
 constexpr std::uint8_t kEpAudioOut = VDS_USB_AUDIO_OUT_ENDPOINT & 0x0f;
 constexpr std::uint8_t kEpAudioIn = VDS_USB_AUDIO_IN_ENDPOINT & 0x0f;
-constexpr std::uint8_t kEpHidIn = VDS_USB_HID_IN_ENDPOINT & 0x0f;
-constexpr std::uint8_t kEpHidOut = VDS_USB_HID_OUT_ENDPOINT & 0x0f;
 
 struct WinsockGuard {
   WinsockGuard() {
@@ -543,21 +544,39 @@ void detach_client(std::string_view busid, Logger &logger) {
 }
 
 // Picks the correct descriptor tables/endpoint-interval info for the
-// configured profile (DS5 vs DSE). All byte content comes straight from
-// include/vds/ds5_usb.h -- this module does not fabricate any descriptor
-// bytes of its own.
+// configured profile (DS5, DSE, or the DS4 / Xbox 360 personas). All byte
+// content comes straight from include/vds/ds5_usb.h and persona_usb.h --
+// this module does not fabricate any descriptor bytes of its own.
 struct ProfileDescriptors {
   const std::uint8_t *device;
   std::size_t device_len;
   const std::uint8_t *config;
   std::size_t config_len;
-  const std::uint8_t *hid;
+  const std::uint8_t *hid; // null for Xbox 360 (no HID)
   std::size_t hid_len;
   const std::uint8_t *hid_report;
   std::size_t hid_report_len;
   std::uint16_t idVendor;
   std::uint16_t idProduct;
+  std::uint16_t bcdDevice;
+  const char *manufacturer;
+  const char *product;
+  // Endpoint numbers of the input/output report pipes (HID, or XUSB).
+  std::uint8_t report_in_ep;
+  std::uint8_t report_out_ep;
+  // The DualSense audio interfaces and isochronous endpoints.
+  bool has_audio;
+  std::span<const WireUsbInterface> interfaces;
 };
+
+constexpr WireUsbInterface kDualSenseInterfaces[] = {
+    {0x01, 0x01, 0x00, 0}, // audio control
+    {0x01, 0x02, 0x00, 0}, // audio streaming out
+    {0x01, 0x02, 0x00, 0}, // audio streaming in
+    {0x03, 0x00, 0x00, 0}, // HID
+};
+constexpr WireUsbInterface kDs4Interfaces[] = {{0x03, 0x00, 0x00, 0}};
+constexpr WireUsbInterface kX360Interfaces[] = {{0xff, 0x5d, 0x01, 0}};
 
 // Builds a USB STRING descriptor (bLength, bDescriptorType=0x03, then
 // UTF-16LE code units -- ASCII input only, which covers all vDS string
@@ -582,6 +601,48 @@ std::vector<std::uint8_t> build_langid_descriptor() {
 }
 
 ProfileDescriptors descriptors_for_profile(std::uint32_t profile) {
+  if (profile == VDS_PROFILE_DS4) {
+    return ProfileDescriptors{
+        vds_ds4_usb_device_descriptor,
+        sizeof(vds_ds4_usb_device_descriptor),
+        vds_ds4_usb_configuration_descriptor,
+        sizeof(vds_ds4_usb_configuration_descriptor),
+        vds_ds4_usb_hid_descriptor,
+        sizeof(vds_ds4_usb_hid_descriptor),
+        vds_ds4_usb_hid_report_descriptor,
+        sizeof(vds_ds4_usb_hid_report_descriptor),
+        VDS_DS4_USB_VENDOR_ID,
+        VDS_DS4_USB_PRODUCT_ID,
+        VDS_DS4_USB_DEVICE_BCD,
+        VDS_DS4_USB_MANUFACTURER_STRING,
+        VDS_DS4_USB_PRODUCT_STRING,
+        VDS_DS4_USB_HID_IN_ENDPOINT & 0x0f,
+        VDS_DS4_USB_HID_OUT_ENDPOINT & 0x0f,
+        false,
+        kDs4Interfaces,
+    };
+  }
+  if (profile == VDS_PROFILE_X360) {
+    return ProfileDescriptors{
+        vds_x360_usb_device_descriptor,
+        sizeof(vds_x360_usb_device_descriptor),
+        vds_x360_usb_configuration_descriptor,
+        sizeof(vds_x360_usb_configuration_descriptor),
+        nullptr,
+        0,
+        nullptr,
+        0,
+        VDS_X360_USB_VENDOR_ID,
+        VDS_X360_USB_PRODUCT_ID,
+        VDS_X360_USB_DEVICE_BCD,
+        VDS_X360_USB_MANUFACTURER_STRING,
+        VDS_X360_USB_PRODUCT_STRING,
+        VDS_X360_USB_IN_ENDPOINT & 0x0f,
+        VDS_X360_USB_OUT_ENDPOINT & 0x0f,
+        false,
+        kX360Interfaces,
+    };
+  }
   if (profile == VDS_PROFILE_DSE) {
     return ProfileDescriptors{
         vds_dse_usb_device_descriptor,
@@ -594,6 +655,13 @@ ProfileDescriptors descriptors_for_profile(std::uint32_t profile) {
         sizeof(vds_dse_usb_hid_report_descriptor),
         0x054c,
         0x0df2,
+        VDS_USB_DEVICE_BCD,
+        VDS_USB_MANUFACTURER_STRING,
+        VDS_DSE_USB_PRODUCT_STRING,
+        VDS_USB_HID_IN_ENDPOINT & 0x0f,
+        VDS_USB_HID_OUT_ENDPOINT & 0x0f,
+        true,
+        kDualSenseInterfaces,
     };
   }
   return ProfileDescriptors{
@@ -607,6 +675,13 @@ ProfileDescriptors descriptors_for_profile(std::uint32_t profile) {
       sizeof(vds_ds5_usb_hid_report_descriptor),
       0x054c,
       0x0ce6,
+      VDS_USB_DEVICE_BCD,
+      VDS_USB_MANUFACTURER_STRING,
+      VDS_DS5_USB_PRODUCT_STRING,
+      VDS_USB_HID_IN_ENDPOINT & 0x0f,
+      VDS_USB_HID_OUT_ENDPOINT & 0x0f,
+      true,
+      kDualSenseInterfaces,
   };
 }
 
@@ -770,13 +845,14 @@ private:
     device.speed = hton32(3);
     device.idVendor = hton16(descriptors.idVendor);
     device.idProduct = hton16(descriptors.idProduct);
-    device.bcdDevice = hton16(VDS_USB_DEVICE_BCD);
+    device.bcdDevice = hton16(descriptors.bcdDevice);
     device.bDeviceClass = descriptors.device[4];
     device.bDeviceSubClass = descriptors.device[5];
     device.bDeviceProtocol = descriptors.device[6];
     device.bConfigurationValue = VDS_USB_CONFIGURATION_VALUE;
     device.bNumConfigurations = VDS_USB_NUM_CONFIGURATIONS;
-    device.bNumInterfaces = 4;
+    device.bNumInterfaces =
+        static_cast<std::uint8_t>(descriptors.interfaces.size());
     return device;
   }
 
@@ -794,16 +870,11 @@ private:
       return false;
     }
 
-    constexpr WireUsbInterface interfaces[4] = {
-        {0x01, 0x01, 0x00, 0},
-        {0x01, 0x02, 0x00, 0},
-        {0x01, 0x02, 0x00, 0},
-        {0x03, 0x00, 0x00, 0},
-    };
     for (const auto &port : snapshot) {
       const WireUsbDevice device = wire_device(*port);
+      const auto interfaces = descriptors_for_profile(port->profile).interfaces;
       if (!send_exact(client, &device, sizeof(device)) ||
-          !send_exact(client, interfaces, sizeof(interfaces))) {
+          !send_exact(client, interfaces.data(), interfaces.size_bytes())) {
         return false;
       }
     }
@@ -1084,13 +1155,13 @@ void VirtualPort::Impl::handle_import_session(SOCKET client) {
   wire_dev.speed = hton32(3);
   wire_dev.idVendor = hton16(desc.idVendor);
   wire_dev.idProduct = hton16(desc.idProduct);
-  wire_dev.bcdDevice = hton16(VDS_USB_DEVICE_BCD);
+  wire_dev.bcdDevice = hton16(desc.bcdDevice);
   wire_dev.bDeviceClass = desc.device[4];
   wire_dev.bDeviceSubClass = desc.device[5];
   wire_dev.bDeviceProtocol = desc.device[6];
   wire_dev.bConfigurationValue = VDS_USB_CONFIGURATION_VALUE;
   wire_dev.bNumConfigurations = VDS_USB_NUM_CONFIGURATIONS;
-  wire_dev.bNumInterfaces = 4;
+  wire_dev.bNumInterfaces = static_cast<std::uint8_t>(desc.interfaces.size());
   if (!send_exact(client, &wire_dev, sizeof(wire_dev))) {
     return;
   }
@@ -1437,11 +1508,9 @@ bool VirtualPort::Impl::handle_cmd_submit(
         if (desc_index == 0) {
           built = build_langid_descriptor();
         } else if (desc_index == 1) {
-          built = build_string_descriptor(VDS_USB_MANUFACTURER_STRING);
+          built = build_string_descriptor(desc.manufacturer);
         } else if (desc_index == 2) {
-          built = build_string_descriptor(profile == VDS_PROFILE_DSE
-                                              ? VDS_DSE_USB_PRODUCT_STRING
-                                              : VDS_DS5_USB_PRODUCT_STRING);
+          built = build_string_descriptor(desc.product);
         }
         if (!built.empty()) {
           const std::size_t copy_len =
@@ -1576,16 +1645,22 @@ bool VirtualPort::Impl::handle_cmd_submit(
     if (device_to_host && reply_data.size() > wLength) {
       reply_data.resize(wLength);
     }
-  } else if (cmd.base.ep == kEpHidIn && cmd.base.direction == kDirIn) {
+  } else if (cmd.base.ep == desc.report_in_ep && cmd.base.direction == kDirIn) {
+    // Input reports: HID on the DualSense and DS4, XUSB on the Xbox 360;
+    // vdsd already translated them for the persona.
     Frame frame;
     if (wait_for_hid_in_frame(frame, 50)) {
       reply_data = frame.payload;
     }
     ret.status = 0;
-  } else if (cmd.base.ep == kEpHidOut && cmd.base.direction == kDirOut) {
+  } else if (cmd.base.ep == desc.report_out_ep &&
+             cmd.base.direction == kDirOut) {
+    // Checked before audio: the Xbox 360's output pipe is endpoint 1 OUT,
+    // which is the speaker stream on the DualSense.
     write_daemon_frame(pipe_server.get(), VDS_FRAME_USB_HID_OUT, out_data);
     ret.status = 0;
-  } else if (cmd.base.ep == kEpAudioOut && cmd.base.direction == kDirOut) {
+  } else if (desc.has_audio && cmd.base.ep == kEpAudioOut &&
+             cmd.base.direction == kDirOut) {
     // Isochronous OUT (speaker/haptics). Treat the whole URB's packets as one
     // contiguous PCM buffer, matching VDS_FRAME_USB_AUDIO_OUT.
     //
@@ -1623,7 +1698,8 @@ bool VirtualPort::Impl::handle_cmd_submit(
     // thread and sent at its real-time due moment instead of instantly.
     // (An earlier blocking-sleep pacing attempt was removed as it stalled
     // the shared session thread; the dedicated pacer avoids that.)
-  } else if (cmd.base.ep == kEpAudioIn && cmd.base.direction == kDirIn) {
+  } else if (desc.has_audio && cmd.base.ep == kEpAudioIn &&
+             cmd.base.direction == kDirIn) {
     // Isochronous IN (mic). Answer with exactly transfer_buffer_length bytes
     // from the jitter buffer (zero-padded on underrun) so the reply is
     // wire-consistent. Crucially, this reply is PACED at the send stage
@@ -1702,10 +1778,10 @@ bool VirtualPort::Impl::handle_cmd_submit(
   // does not inherit stale lateness or a far-future anchor.
   // Wire layout differs by direction: OUT carries header + iso descriptors
   // (no data); IN carries header + data payload + iso descriptors.
-  const bool pace_out = cmd.base.ep == kEpAudioOut &&
+  const bool pace_out = desc.has_audio && cmd.base.ep == kEpAudioOut &&
                         cmd.base.direction == kDirOut &&
                         cmd.number_of_packets > 0;
-  const bool pace_in = cmd.base.ep == kEpAudioIn &&
+  const bool pace_in = desc.has_audio && cmd.base.ep == kEpAudioIn &&
                        cmd.base.direction == kDirIn &&
                        cmd.number_of_packets > 0;
   if (pace_out || pace_in) {
