@@ -49,6 +49,7 @@
 #include "vds_sleep_watch.hh"
 #include "vds_host_watch.hh"
 #include "vds_bt.hh"
+#include "vds_bridge.hh"
 #include "vds_bt_mode.hh"
 #include "vds_build_info.hh"
 #include "vds_common.hh"
@@ -74,81 +75,11 @@ constexpr const char *kVirtualPortProviderUnavailableReason =
     "virtual port provider unavailable";
 constexpr const char *kLinuxVirtualPortProviderUnavailable =
     "vds_hcd kernel module is not loaded or no /dev/vds# ports are available";
-constexpr std::size_t kTraceDumpMaxBytes = 96;
-constexpr std::size_t kUsbInputButtonsOffset = 8;
-constexpr std::size_t kUsbInputButtonsSize = 4;
-constexpr std::size_t kUsbInputMuteButtonOffset = 10;
-constexpr std::size_t kUsbInputHeadsetOffset = 54;
-constexpr std::uint8_t kUsbInputHeadphonesPluggedMask = 0x01;
-constexpr std::uint8_t kUsbInputMicPluggedMask = 0x02;
-constexpr std::uint8_t kUsbInputMuteButtonMask = 0x04;
-constexpr std::uint64_t kInputTraceSummaryInterval = 1000;
-constexpr std::uint64_t kOutputTraceSummaryInterval = 250;
 constexpr int kMaxPortFramesPerWake = 64;
 constexpr int kMaxBtPacketsPerWake = 64;
-constexpr int kPendingOutputPollMs = 2;
-constexpr std::size_t kLinuxSpeakerInputFrames = vds::kPcmWindowFrames;
-constexpr auto kInputTraceGapWarn = std::chrono::milliseconds(20);
-constexpr auto kInputTraceSlowWriteWarn = std::chrono::milliseconds(5);
-constexpr auto kOutputTraceSlowWarn = std::chrono::milliseconds(5);
-constexpr auto kOutputTraceFeatureSlowWarn = std::chrono::milliseconds(20);
-/*
- * Keep the Linux sender cadence aligned with the 512-frame extraction window
- * used by the Windows transport (~10.67 ms per 0x36 packet); the extractor
- * resamples each window to one Opus frame.
- */
-constexpr auto kAudioOutputInterval = std::chrono::microseconds(
-    (static_cast<std::int64_t>(kLinuxSpeakerInputFrames) * 1000000 +
-     VDS_AUDIO_SAMPLE_RATE / 2) /
-    VDS_AUDIO_SAMPLE_RATE);
-/*
- * A send that is at most this late keeps the fixed cadence (the next packet
- * goes out immediately to catch up); anything later resyncs to the wall clock
- * so a stalled stream does not replay a backlog.
- */
-constexpr auto kMaxAudioCatchup = 2 * kAudioOutputInterval;
-/*
- * Chunks to buffer after the queue runs dry before sending again (~21 ms).
- * Input and output run at the same rate, so this stays as latency on every
- * speaker sample and haptic for the rest of the stream; AudioQueueTrimmer keeps
- * it from growing past this. One chunk is not enough: USB delivers audio in
- * bursts that do not line up with the send times, and the queue keeps running
- * dry (tested: refills climbed continuously).
- */
-constexpr std::size_t kAudioPrimeChunks = 2;
-constexpr auto kHapticsOutputBlockedRetry = std::chrono::milliseconds(2);
 constexpr auto kBluetoothPreemptWait = std::chrono::milliseconds(2000);
 constexpr auto kBluetoothPreemptPoll = std::chrono::milliseconds(100);
 constexpr int kInitialFeatureReportPollMs = 5000;
-constexpr std::size_t kMaxPendingAudioChunks = 8;
-/*
- * Speaker-silent packets (~1 s) before switching to haptics-only 0x33 reports:
- * the same haptics and state in about half the airtime of 0x36. Speaker audio
- * switches back to 0x36 on its first packet; the Opus encoder keeps running on
- * the silence, so it resumes cleanly.
- */
-constexpr std::size_t kHapticsOnlyAfterSilentPackets = 94;
-// Controller mic open re-sends while waiting for its first packet.
-constexpr std::chrono::milliseconds kMicOpenRetry{250};
-constexpr std::uint32_t kMicOpenMaxResends = 20;
-// Mic peak (permille of full scale) above which a packet counts as sound.
-constexpr std::uint16_t kMicSoundPermille = 10;
-// Controller audio buffer (3 kHz samples) used while the mic records; the
-// value upstream sends with the mic.
-constexpr std::uint8_t kMicBufferLength = 64;
-constexpr std::uint8_t kTestCommandReportId = 0x80;
-constexpr std::uint8_t kTestCommandResultReportId = 0x81;
-constexpr std::uint8_t kTestCommandCompleteStatus = 0x02;
-constexpr std::uint8_t kTestCommandAudioDevice = 0x06;
-constexpr std::uint8_t kTestCommandWaveoutPrepare = 0x04;
-constexpr std::uint8_t kTestCommandWaveoutControl = 0x02;
-constexpr std::uint8_t kTestCommandSpeakerParam = 0x08;
-constexpr std::uint32_t kSpeakerWaveoutFrequencyHz = 1000;
-constexpr std::uint32_t kSpeakerWaveoutPeriodFrames =
-    VDS_AUDIO_SAMPLE_RATE / kSpeakerWaveoutFrequencyHz;
-constexpr double kSpeakerWaveoutTwoPi = 6.28318530717958647692;
-/* Arbitrary fixed amplitude used only for synthetic WebHID speaker waveout. */
-constexpr std::int16_t kSpeakerWaveoutAmplitude = 12000;
 constexpr std::array<std::uint8_t, 3> kInitialFeatureReportIds = {0x09, 0x20,
                                                                   0x05};
 
@@ -157,21 +88,6 @@ volatile sig_atomic_t g_log_reopen_requested = 0;
 // True while BlueZ's input plugin owns the HID PSMs ("normal" Bluetooth mode);
 // vdsd must then leave BlueZ-connected controllers alone.
 bool g_bluetooth_normal_mode = false;
-// Host persona selected through the companion app; applied to each virtual
-// port when its controller connects and whenever it changes.
-vds::HostPersona g_host_persona = vds::HostPersona::DualSense;
-// Built-in speaker loudness boost (--speaker-boost-db); bypassed while
-// headphones are plugged into the controller.
-float g_speaker_boost_db = vds::kDefaultSpeakerBoostDb;
-// Controller microphone forwarding: off unless the companion app enables mic
-// pass-through (or vdsd runs with --mic). While the controller streams its
-// mic, speaker/haptics audio audibly degrades (clipping, and the speaker gain
-// stops having an effect), so it stays closed by default.
-bool g_mic_forced = false;
-bool g_mic_allowed = false;
-bool g_mic_muted = false;
-bool g_mute_led_enabled = true;
-std::uint16_t g_mic_volume_percent = 100;
 
 struct Options {
   std::string socket = kDefaultControlSocket;
@@ -182,130 +98,14 @@ struct Options {
   bool mic_enabled = false;
 };
 
-struct LatencyTraceStats {
-  std::uint64_t count = 0;
-  std::uint64_t total_us = 0;
-  std::uint64_t max_us = 0;
-};
-
-/*
- * Always-on audio delivery stats for the companion Diagnostics view. The
- * controller does not report buffer underruns, so a send gap longer than the
- * controller's audio buffer is counted as a probable dropout ("late").
- */
-struct AudioStats {
-  std::uint8_t buffer_length = 64; // 3 kHz samples
-  bool buffer_auto = false;
-  std::uint64_t trims_total = 0;
-  bool haptics_only = false;
-  std::uint64_t haptics_only_total = 0;
-  Clock::time_point last_send{};
-  std::uint64_t packets_total = 0;
-  std::uint64_t late_total = 0;
-  std::uint64_t refills_total = 0;
-  // Since the previous `audio` control request.
-  Clock::time_point window_start{};
-  std::uint64_t window_packets = 0;
-  std::uint64_t window_mic_packets = 0;
-  // Controller mic packets: forwarded, and arrived while the mic was closed
-  // (each burst of those re-sends the close report).
-  std::uint64_t mic_packets_total = 0;
-  std::uint64_t mic_while_closed_total = 0;
-  Clock::time_point last_mic_close_resend{};
-  // Time from opening the controller mic to its first packet (last start).
-  std::int64_t mic_startup_ms = -1;
-  // Time from opening the mic to the first packet above near-silence (last
-  // start); shows a mic that warms up after it is switched on.
-  std::int64_t mic_first_sound_ms = -1;
-  std::uint64_t window_late = 0;
-  std::uint64_t window_refills = 0;
-  std::int64_t window_max_gap_us = 0;
-};
-
-struct TraceState {
-  std::vector<std::uint8_t> last_hid_out;
-  std::uint64_t dropped_usb_frame_count = 0;
-  std::uint64_t dropped_audio_haptics_count = 0;
-  std::uint64_t queue_dropped_audio_haptics_count = 0;
-  std::uint64_t stale_audio_haptics_count = 0;
-  std::uint64_t blocked_audio_haptics_count = 0;
-  std::uint64_t deferred_bt_state_count = 0;
-  std::uint64_t coalesced_bt_state_count = 0;
-  std::uint64_t blocked_bt_state_count = 0;
-  std::uint64_t audio_usb_frame_count = 0;
-  std::uint64_t bt_input_count = 0;
-  std::uint64_t bt_input_unknown_count = 0;
-  std::uint64_t bt_mic_packet_count = 0;
-  std::uint64_t bt_mic_drop_count = 0;
-  std::uint64_t bt_mic_decode_fail_count = 0;
-  std::uint64_t audio_in_forward_count = 0;
-  std::uint64_t audio_in_write_short_count = 0;
-  std::uint16_t mic_last_decoded_bytes = 0;
-  std::uint16_t mic_peak_permille = 0;
-  LatencyTraceStats output_hid_latency;
-  LatencyTraceStats output_feature_latency;
-  LatencyTraceStats output_audio_latency;
-  LatencyTraceStats output_audio_extract_latency;
-  LatencyTraceStats output_audio_send_latency;
-  std::uint64_t input_write_count = 0;
-  std::uint64_t input_write_total_us = 0;
-  std::uint64_t input_write_max_us = 0;
-  std::uint64_t input_gap_max_us = 0;
-  Clock::time_point last_input_time{};
-  bool have_last_input_time = false;
-  std::array<std::uint8_t, kUsbInputButtonsSize> last_input_buttons{};
-  bool have_last_input_buttons = false;
-  bool audio_haptics_nonzero_seen = false;
-  bool haptics_burst_active = false;
-  std::uint64_t haptics_burst_chunks = 0;
-};
-
-using vds::kTraceInputAudio;
-using vds::kTraceInputControl;
 using vds::kTraceOutput;
 using vds::trace_enabled;
 using vds::trim_command;
 
-struct VirtualPort {
-  std::string path;
+// A vds_hcd port: the shared bridge state plus its device node and the
+// native-game watch.
+struct VirtualPort : vds::BridgePort {
   vds::UniqueFd fd;
-  vds::PcmAudioExtractor extractor{kLinuxSpeakerInputFrames};
-  vds::PcmAudioExtractor waveout_extractor{kLinuxSpeakerInputFrames};
-  vds::MicAudioDecoder mic_decoder;
-  vds::HapticsPacketBuilder haptics_builder;
-  vds::DsOutputState output_state;
-  std::deque<vds::AudioChunk> pending_audio_chunks;
-  std::optional<vds::DsState> last_sent_bt_state;
-  std::optional<vds::DsState> pending_bt_state;
-  std::optional<vds::BtStateReport> pending_bt_state_report;
-  Clock::time_point next_haptics_send_time{};
-  bool audio_primed = false;
-  vds::AudioQueueTrimmer queue_trimmer;
-  vds::HapticsBufferTuner buffer_tuner;
-  std::size_t silent_speaker_packets = 0;
-  vds::HostPersona persona = vds::HostPersona::DualSense;
-  vds::PersonaState persona_state;
-  bool audio_out_stream_active = false;
-  // Host capture stream open (audio-in altsetting) vs. controller mic open.
-  bool audio_in_requested = false;
-  bool audio_in_stream_active = false;
-  // Controller mic start: when it was opened and whether its first packet has
-  // arrived; until then the open report is re-sent (a lost one would leave
-  // the start of a recording silent).
-  Clock::time_point mic_opened_at{};
-  Clock::time_point mic_open_resent_at{};
-  std::uint32_t mic_open_resends = 0;
-  bool mic_first_packet = false;
-  bool mic_first_sound = false;
-  bool mic_muted = false;
-  bool mute_button_down = false;
-  bool headset_plugged = false;
-  bool headset_mic_plugged = false;
-  bool speaker_waveout_selected = true;
-  bool speaker_waveout_active = false;
-  std::uint32_t speaker_waveout_phase = 0;
-  std::uint16_t haptics_gain_percent = 100;
-  std::uint8_t battery_status = 0xff;
   // Restore after a native DualSense game: watch the virtual controller's
   // hidraw node. Each program that opens it (in order) keeps a snapshot of
   // the output state from just before it did; when the latest one closes it,
@@ -318,27 +118,7 @@ struct VirtualPort {
   int hidraw_watch = -1;
   std::set<pid_t> host_baseline;
   std::vector<HostSession> host_sessions;
-  // Idle Disconnect: last input that counts as activity.
-  Clock::time_point last_input_activity{};
-  // Diagnostic counters: the `audio` control request resets the window part.
-  mutable AudioStats audio_stats;
-  vds::CompanionInputState companion_input;
-  std::array<std::vector<std::uint8_t>, 256> feature_cache;
-  std::array<bool, 256> feature_cached;
-  std::vector<std::uint8_t> pending_feature_reports;
-  TraceState trace_state;
 };
-
-float speaker_boost_db(const VirtualPort &port) {
-  return port.headset_plugged ? 0.0f : g_speaker_boost_db;
-}
-
-// The companion speaker volume slider only applies to the built-in speaker.
-std::uint16_t speaker_volume_percent(const VirtualPort &port) {
-  return port.headset_plugged
-             ? 100
-             : port.output_state.companion_overrides().speaker_volume_percent;
-}
 
 struct ControllerRuntime {
   vds::ControllerConfig config;
@@ -349,6 +129,46 @@ struct ControllerRuntime {
   vds::UniqueFd pending_interrupt_fd;
   bool virtual_connected = false;
   std::string last_error;
+};
+
+bool write_vds_frame(VirtualPort &port, std::span<const std::uint8_t> bytes);
+
+// vds_bridge's view of a controller's L2CAP link: feature reports are fetched
+// asynchronously and answered from handle_bt_control.
+class LinuxBridgeBluetooth final : public vds::BridgeBluetooth {
+public:
+  explicit LinuxBridgeBluetooth(vds::BtL2capBackend &backend)
+      : backend_(backend) {}
+
+  bool try_send_output_report(std::span<const std::uint8_t> report) override {
+    return backend_.try_send_output_report(report);
+  }
+  std::optional<std::vector<std::uint8_t>>
+  get_feature_report(std::uint8_t report_id) override {
+    backend_.send_feature_get(report_id);
+    return std::nullopt;
+  }
+  void set_feature_report(std::span<const std::uint8_t> report) override {
+    backend_.send_feature_set(report);
+  }
+
+private:
+  vds::BtL2capBackend &backend_;
+};
+
+// vds_bridge's view of a /dev/vds# port.
+class LinuxBridgeUsb final : public vds::BridgeUsb {
+public:
+  explicit LinuxBridgeUsb(VirtualPort &port) : port_(port) {}
+
+  bool write_frame(std::uint32_t type,
+                   std::span<const std::uint8_t> payload) override {
+    return write_vds_frame(
+        port_, vds::frame_bytes(static_cast<std::uint16_t>(type), payload));
+  }
+
+private:
+  VirtualPort &port_;
 };
 
 enum class EventType : std::uint32_t {
@@ -457,88 +277,6 @@ int open_required(const std::string &path, int flags) {
   return fd;
 }
 
-void trace_output_latency(const std::string &device, std::string_view label,
-                          LatencyTraceStats &stats, Clock::duration duration,
-                          Clock::duration slow_threshold, vds::Logger &logger) {
-  const std::uint64_t elapsed_us = duration_us(duration);
-  ++stats.count;
-  stats.total_us += elapsed_us;
-  stats.max_us = std::max(stats.max_us, elapsed_us);
-
-  if (duration >= slow_threshold) {
-    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
-               device + " slow " + std::string(label) +
-                   " latency count=" + std::to_string(stats.count) +
-                   " latency_us=" + std::to_string(elapsed_us));
-  }
-  if (stats.count == 1 || stats.count % kOutputTraceSummaryInterval == 0) {
-    logger.log(vds::LogScope::Output, vds::LogLevel::Debug,
-               device + " " + std::string(label) +
-                   " latency summary count=" + std::to_string(stats.count) +
-                   " avg_us=" + std::to_string(stats.total_us / stats.count) +
-                   " max_us=" + std::to_string(stats.max_us));
-  }
-}
-
-void trace_hid_out_report(const std::string &device,
-                          std::span<const std::uint8_t> payload,
-                          TraceState &trace_state, vds::Logger &logger) {
-  std::ostringstream line;
-  line << device << " hid out";
-  if (!payload.empty()) {
-    line << " report=" << hex_u8(payload[0]);
-  }
-  if (payload.size() >= 5) {
-    /*
-     * USB report 0x02 carries SetStateData after the report ID. These fields
-     * show whether a plain rumble request exists before the HD haptics audio
-     * path is involved.
-     */
-    line << " flags0=" << hex_u8(payload[1]) << " flags1=" << hex_u8(payload[2])
-         << " rumble_r=" << static_cast<unsigned>(payload[3])
-         << " rumble_l=" << static_cast<unsigned>(payload[4]);
-  }
-  if (payload.size() >= 40) {
-    line << " light_flags=" << hex_u8(payload[39]);
-  }
-  logger.log(vds::LogScope::Hid, vds::LogLevel::Debug, line.str());
-
-  const bool hid_out_changed =
-      trace_state.last_hid_out.size() != payload.size() ||
-      !std::equal(trace_state.last_hid_out.begin(),
-                  trace_state.last_hid_out.end(), payload.begin());
-  if (!hid_out_changed) {
-    return;
-  }
-
-  trace_state.last_hid_out.assign(payload.begin(), payload.end());
-  std::ostringstream changed;
-  changed << device
-          << " hid out changed raw=" << hex_bytes(payload, kTraceDumpMaxBytes);
-  if (payload.size() >= 33 && payload[0] == VDS_USB_OUTPUT_REPORT_ID) {
-    /*
-     * SetStateData begins after the report ID. Offsets 10..20 and 21..31 are
-     * the right/left adaptive trigger blocks from the DualSense USB report.
-     */
-    changed << " right_trigger=" << hex_bytes(payload.subspan(11, 11), 11)
-            << " left_trigger=" << hex_bytes(payload.subspan(22, 11), 11);
-  }
-  logger.log(vds::LogScope::Hid, vds::LogLevel::Debug, changed.str());
-}
-
-const char *usb_interface_type_name(std::uint8_t type) {
-  switch (type) {
-  case VDS_USB_INTERFACE_HID:
-    return "hid";
-  case VDS_USB_INTERFACE_AUDIO_OUT:
-    return "audio_out";
-  case VDS_USB_INTERFACE_AUDIO_IN:
-    return "audio_in";
-  default:
-    return "unknown";
-  }
-}
-
 const char *profile_name(std::uint32_t profile) {
   if (profile == VDS_PROFILE_DSE) {
     return "dualsense-edge";
@@ -607,8 +345,8 @@ int open_control_socket(const std::string &path) {
   return fd.release();
 }
 
-bool write_vds_frame(VirtualPort &port, std::span<const std::uint8_t> bytes,
-                     bool trace, vds::Logger &logger) {
+// Writes one frame to the port; false when its queue is full (dropped).
+bool write_vds_frame(VirtualPort &port, std::span<const std::uint8_t> bytes) {
   while (true) {
     const ssize_t written = ::write(port.fd.get(), bytes.data(), bytes.size());
     if (written == static_cast<ssize_t>(bytes.size())) {
@@ -621,129 +359,10 @@ bool write_vds_frame(VirtualPort &port, std::span<const std::uint8_t> bytes,
       continue;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOSPC) {
-      ++port.trace_state.dropped_usb_frame_count;
-      if (trace) {
-        if (port.trace_state.dropped_usb_frame_count == 1 ||
-            port.trace_state.dropped_usb_frame_count % 1000 == 0) {
-          logger.log(
-              vds::LogScope::Port, vds::LogLevel::Warn,
-              port.path + " vDS write queue full count=" +
-                  std::to_string(port.trace_state.dropped_usb_frame_count));
-        }
-      }
       return false;
     }
     throw std::runtime_error("write failed: " +
                              std::string(std::strerror(errno)));
-  }
-}
-
-void cache_feature_report(VirtualPort &port,
-                          std::span<const std::uint8_t> report, bool trace,
-                          vds::Logger &logger) {
-  if (report.empty()) {
-    return;
-  }
-
-  const std::uint8_t report_id = report[0];
-  port.feature_cache[report_id] =
-      std::vector<std::uint8_t>(report.begin(), report.end());
-  port.feature_cached[report_id] = true;
-
-  const auto frame = vds::frame_bytes(VDS_FRAME_USB_FEATURE_REPLY,
-                                      port.feature_cache[report_id]);
-  (void)write_vds_frame(port, frame, trace, logger);
-}
-
-bool flush_pending_bt_state_report(VirtualPort &port,
-                                   vds::BtL2capBackend &bt_backend,
-                                   std::uint32_t trace_flags,
-                                   vds::Logger &logger) {
-  if (!port.pending_bt_state_report || !port.pending_bt_state) {
-    return true;
-  }
-
-  const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
-  if (bt_backend.try_send_output_report(*port.pending_bt_state_report)) {
-    port.last_sent_bt_state = *port.pending_bt_state;
-    port.pending_bt_state.reset();
-    port.pending_bt_state_report.reset();
-    if (output_trace) {
-      logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                 port.path + " flushed pending BT 0x31 state report");
-    }
-    return true;
-  }
-
-  ++port.trace_state.blocked_bt_state_count;
-  if (output_trace && (port.trace_state.blocked_bt_state_count == 1 ||
-                       port.trace_state.blocked_bt_state_count % 1000 == 0)) {
-    logger.log(vds::LogScope::Hid, vds::LogLevel::Warn,
-               port.path +
-                   " pending BT 0x31 state report still blocked "
-                   "count=" +
-                   std::to_string(port.trace_state.blocked_bt_state_count));
-  }
-  return false;
-}
-
-void forward_bt_state_if_changed(VirtualPort &port,
-                                 vds::BtL2capBackend &bt_backend,
-                                 std::uint32_t trace_flags, vds::Logger &logger,
-                                 std::string_view reason) {
-  const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
-
-  (void)flush_pending_bt_state_report(port, bt_backend, trace_flags, logger);
-
-  const vds::DsState state = port.output_state.state();
-  if (port.last_sent_bt_state && *port.last_sent_bt_state == state) {
-    if (port.pending_bt_state) {
-      port.pending_bt_state.reset();
-      port.pending_bt_state_report.reset();
-      ++port.trace_state.coalesced_bt_state_count;
-    }
-    if (output_trace) {
-      logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                 port.path + " " + std::string(reason) +
-                     " skipped: BT state unchanged");
-    }
-    return;
-  }
-  if (port.pending_bt_state && *port.pending_bt_state == state) {
-    if (output_trace) {
-      logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                 port.path + " " + std::string(reason) +
-                     " skipped: BT state already pending");
-    }
-    return;
-  }
-
-  const auto packet = port.output_state.build_bt_state_report();
-  if (bt_backend.try_send_output_report(packet)) {
-    port.last_sent_bt_state = state;
-    port.pending_bt_state.reset();
-    port.pending_bt_state_report.reset();
-    if (output_trace) {
-      logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                 port.path + " " + std::string(reason) +
-                     " forwarded as BT 0x31 state report");
-    }
-    return;
-  }
-
-  if (port.pending_bt_state) {
-    ++port.trace_state.coalesced_bt_state_count;
-  }
-  ++port.trace_state.deferred_bt_state_count;
-  port.pending_bt_state = state;
-  port.pending_bt_state_report = packet;
-  if (output_trace && (port.trace_state.deferred_bt_state_count == 1 ||
-                       port.trace_state.deferred_bt_state_count % 1000 == 0)) {
-    logger.log(vds::LogScope::Hid, vds::LogLevel::Warn,
-               port.path + " deferred BT 0x31 state report count=" +
-                   std::to_string(port.trace_state.deferred_bt_state_count) +
-                   " coalesced=" +
-                   std::to_string(port.trace_state.coalesced_bt_state_count));
   }
 }
 
@@ -766,52 +385,12 @@ void ioctl_set_profile(int fd, std::uint32_t profile) {
 }
 
 void reset_virtual_port(VirtualPort &port) {
-  port.extractor = vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
-  port.waveout_extractor =
-      vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
-  port.mic_decoder = vds::MicAudioDecoder{};
-  port.haptics_builder = vds::HapticsPacketBuilder{};
-  port.haptics_builder.set_buffer_length(port.audio_stats.buffer_length);
-  port.output_state = vds::DsOutputState{};
-  port.pending_audio_chunks.clear();
-  port.audio_primed = false;
-  port.last_sent_bt_state.reset();
-  port.pending_bt_state.reset();
-  port.pending_bt_state_report.reset();
-  port.next_haptics_send_time = {};
-  port.audio_out_stream_active = false;
-  port.audio_in_requested = false;
-  port.audio_in_stream_active = false;
-  port.mic_muted = false;
-  port.mute_button_down = false;
-  port.headset_plugged = false;
-  port.headset_mic_plugged = false;
-  port.speaker_waveout_selected = true;
-  port.speaker_waveout_active = false;
-  port.speaker_waveout_phase = 0;
-  port.haptics_gain_percent = 100;
-  port.battery_status = 0xff;
-    port.host_sessions.clear();
-  port.last_input_activity = {};
-  port.audio_stats = {};
-  port.companion_input = {};
-  port.feature_cache = {};
-  port.feature_cached = {};
-  port.pending_feature_reports.clear();
-  port.trace_state = TraceState{};
+  vds::bridge_reset(port);
+  port.host_sessions.clear();
 }
 
 void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
-  port.pending_audio_chunks.clear();
-  port.audio_primed = false;
-  port.next_haptics_send_time = {};
-  port.audio_out_stream_active = false;
-  port.audio_in_requested = false;
-  port.audio_in_stream_active = false;
-  port.mic_muted = false;
-  port.mute_button_down = false;
-  port.speaker_waveout_active = false;
-  port.speaker_waveout_phase = 0;
+  vds::bridge_on_disconnect(port);
   try {
     ioctl_noarg(port.fd.get(), VDS_IOC_DISCONNECT, "VDS_IOC_DISCONNECT");
     logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
@@ -822,423 +401,37 @@ void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
   }
 }
 
-// Keeps the controller mic open for as long as the mic is on (switch on and
-// not muted), so a recording starts without the controller's warm-up; its
-// audio is forwarded only while the host records. Also pushes mic mute (and
-// the mute light). Callers forward the 0x31 state afterwards for the LED.
 void sync_port_mic(VirtualPort &port, vds::BtL2capBackend *bt_backend,
                    vds::Logger &logger) {
-  const bool open = g_mic_allowed && !g_mic_muted;
-  const bool open_changed = open != port.audio_in_stream_active;
-  const bool mute_changed = g_mic_muted != port.mic_muted;
-  port.mic_muted = g_mic_muted;
-  port.audio_in_stream_active = open;
-  if (open_changed) {
-    port.mic_decoder = vds::MicAudioDecoder{};
-    port.mic_opened_at = Clock::now();
-    port.mic_open_resent_at = port.mic_opened_at;
-    port.mic_open_resends = 0;
-    port.mic_first_packet = false;
-    port.mic_first_sound = false;
+  if (bt_backend == nullptr) {
+    vds::bridge_sync_mic(port, nullptr, logger);
+    return;
   }
-  if (bt_backend && (open_changed || (open && mute_changed))) {
-    bt_backend->try_send_output_report(
-        port.output_state.build_bt_mic_state_report(open, port.mic_muted));
-    if (open_changed) {
-      const bool sent = bt_backend->try_send_output_report(
-          port.output_state.build_bt_mic_report(
-              open, std::max(port.audio_stats.buffer_length, kMicBufferLength)));
-      logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
-                 port.path + " controller mic " +
-                     std::string(open ? "opened" : "closed") +
-                     " sent=" + (sent ? "yes" : "no"));
-    }
-  }
-  // Mute light on whenever the mic is not live (off or muted), like a PS5,
-  // unless the companion turned the light off.
-  port.output_state.set_mic_mute_led(g_mute_led_enabled &&
-                                     !(g_mic_allowed && !g_mic_muted));
+  LinuxBridgeBluetooth bt(*bt_backend);
+  vds::bridge_sync_mic(port, &bt, logger);
+}
+
+void forward_bt_state_if_changed(VirtualPort &port,
+                                 vds::BtL2capBackend &bt_backend,
+                                 std::uint32_t trace_flags, vds::Logger &logger,
+                                 std::string_view reason) {
+  LinuxBridgeBluetooth bt(bt_backend);
+  vds::bridge_forward_state_if_changed(port, bt, trace_flags, logger, reason);
 }
 
 void handle_frame(const vds_frame_header &header,
                   std::span<const std::uint8_t> payload,
                   vds::BtL2capBackend *bt_backend, std::uint32_t trace_flags,
                   VirtualPort &port, vds::Logger &logger) {
-  if (header.type == VDS_FRAME_USB_INTERFACE) {
-    if (payload.size() != sizeof(vds_usb_interface_event)) {
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
-                 port.path + " malformed USB interface event len=" +
-                     std::to_string(payload.size()));
-      return;
-    }
-
-    vds_usb_interface_event event{};
-    std::memcpy(&event, payload.data(), sizeof(event));
-
-    std::ostringstream line;
-    line << port.path << " USB set_interface type="
-         << usb_interface_type_name(event.interface_type)
-         << " number=" << static_cast<unsigned>(event.interface_number)
-         << " alt=" << static_cast<unsigned>(event.altsetting);
-    if (event.interface_type == VDS_USB_INTERFACE_AUDIO_OUT ||
-        event.interface_type == VDS_USB_INTERFACE_AUDIO_IN) {
-      line << " stream=" << (event.altsetting != 0 ? "on" : "off");
-    }
-    logger.log(vds::LogScope::Usb, vds::LogLevel::Info, line.str());
-    if (event.interface_type == VDS_USB_INTERFACE_AUDIO_OUT) {
-      const bool active = event.altsetting != 0;
-      port.audio_out_stream_active = active;
-      port.output_state.set_audio_out_stream_active(active,
-                                                    port.headset_plugged);
-      port.pending_audio_chunks.clear();
-      port.audio_primed = false;
-      port.next_haptics_send_time = {};
-      if (active) {
-        port.extractor =
-            vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
-      }
-      if (bt_backend) {
-        forward_bt_state_if_changed(
-            port, *bt_backend, trace_flags, logger,
-            active ? "audio out interface route on"
-                   : "audio out interface route off");
-      }
-    } else if (event.interface_type == VDS_USB_INTERFACE_AUDIO_IN) {
-      port.audio_in_requested = event.altsetting != 0;
-      sync_port_mic(port, bt_backend, logger);
-    }
+  LinuxBridgeUsb usb(port);
+  if (bt_backend == nullptr) {
+    vds::bridge_handle_usb_frame(port, header.type, payload, nullptr, usb,
+                                 trace_flags, logger);
     return;
   }
-
-  const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
-  if (output_trace) {
-    std::ostringstream line;
-    line << port.path << " frame " << vds::frame_type_name(header.type)
-         << " len=" << header.length << " seq=" << header.sequence;
-
-    bool emit_trace = true;
-    if (header.type == VDS_FRAME_USB_AUDIO_OUT &&
-        payload.size() >= VDS_AUDIO_CHANNELS * sizeof(std::int16_t)) {
-      std::array<int, VDS_AUDIO_CHANNELS> peaks{};
-      const std::size_t frame_size = VDS_AUDIO_CHANNELS * sizeof(std::int16_t);
-      const std::size_t frames = payload.size() / frame_size;
-      for (std::size_t frame = 0; frame < frames; ++frame) {
-        const std::uint8_t *base = payload.data() + frame * frame_size;
-        for (std::size_t channel = 0; channel < VDS_AUDIO_CHANNELS; ++channel) {
-          const auto low =
-              static_cast<std::uint16_t>(base[channel * sizeof(std::int16_t)]);
-          const auto high = static_cast<std::uint16_t>(
-                                base[channel * sizeof(std::int16_t) + 1])
-                            << 8;
-          const auto sample = static_cast<std::int16_t>(low | high);
-          peaks[channel] =
-              std::max(peaks[channel], std::abs(static_cast<int>(sample)));
-        }
-      }
-
-      ++port.trace_state.audio_usb_frame_count;
-      const bool haptics_nonzero = peaks[2] != 0 || peaks[3] != 0;
-      emit_trace =
-          port.trace_state.audio_usb_frame_count == 1 ||
-          port.trace_state.audio_usb_frame_count % 250 == 0 ||
-          (haptics_nonzero && !port.trace_state.audio_haptics_nonzero_seen);
-      port.trace_state.audio_haptics_nonzero_seen |= haptics_nonzero;
-      line << " pcm_peak_ch0=" << peaks[0] << " pcm_peak_ch1=" << peaks[1]
-           << " pcm_peak_ch2=" << peaks[2] << " pcm_peak_ch3=" << peaks[3];
-    }
-
-    if (emit_trace) {
-      logger.log(vds::LogScope::Usb, vds::LogLevel::Debug, line.str());
-    }
-  }
-
-  if (header.type == VDS_FRAME_USB_HID_OUT) {
-    const auto start = Clock::now();
-    if (output_trace) {
-      trace_hid_out_report(port.path, payload, port.trace_state, logger);
-    }
-    std::optional<std::array<std::uint8_t, 1 + VDS_SET_STATE_SIZE>>
-        persona_output;
-    std::span<const std::uint8_t> ds5_output = payload;
-    if (port.persona != vds::HostPersona::DualSense) {
-      persona_output = vds::persona_output_to_ds5(port.persona, payload,
-                                                  port.persona_state);
-      if (!persona_output) {
-        return;
-      }
-      ds5_output = *persona_output;
-    }
-    if (!port.output_state.apply_usb_output_report(ds5_output)) {
-      if (output_trace) {
-        logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                   port.path + " hid out ignored: unsupported output report");
-      }
-      return;
-    }
-    if (port.audio_out_stream_active || port.speaker_waveout_active) {
-      port.output_state.set_audio_out_stream_active(true, port.headset_plugged);
-    }
-    if (output_trace) {
-      logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                 port.path + " hid out accepted for BT state update");
-    }
-
-    if (bt_backend) {
-      forward_bt_state_if_changed(port, *bt_backend, trace_flags, logger,
-                                  "hid out");
-    }
-
-    if (output_trace) {
-      trace_output_latency(port.path, "hid_out",
-                           port.trace_state.output_hid_latency,
-                           Clock::now() - start, kOutputTraceSlowWarn, logger);
-    }
-    return;
-  }
-
-  if (header.type == VDS_FRAME_USB_FEATURE_GET) {
-    const auto start = Clock::now();
-    if (payload.empty()) {
-      return;
-    }
-    const std::uint8_t report_id = payload[0];
-    const unsigned requested_length =
-        payload.size() >= 3
-            ? static_cast<unsigned>(payload[1] |
-                                    (static_cast<unsigned>(payload[2]) << 8))
-            : (payload.size() >= 2 ? static_cast<unsigned>(payload[1]) : 0);
-    if (port.persona == vds::HostPersona::Ds4) {
-      // DS4 feature reports are answered locally; calibration and MAC come
-      // from the DualSense's cached reports 0x05 and 0x09.
-      const auto cached = [&](std::uint8_t id) {
-        return port.feature_cached[id]
-                   ? std::span<const std::uint8_t>(port.feature_cache[id])
-                   : std::span<const std::uint8_t>();
-      };
-      const auto reply = vds::ds4_feature_report(
-          report_id, requested_length, cached(0x05), cached(0x09));
-      const auto frame =
-          vds::frame_bytes(VDS_FRAME_USB_FEATURE_REPLY, reply);
-      (void)write_vds_frame(port, frame, output_trace, logger);
-      return;
-    }
-    if (port.persona != vds::HostPersona::DualSense) {
-      return;
-    }
-    const bool cache_hit = port.feature_cached[report_id];
-    if (output_trace) {
-      logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                 port.path + " feature get report=" + hex_u8(report_id) +
-                     " request_len=" + std::to_string(requested_length) +
-                     " cache=" + (cache_hit ? "hit" : "miss") + " forwarded=" +
-                     ((bt_backend && !cache_hit) ? "yes" : "no"));
-    }
-    if (cache_hit) {
-      const auto frame = vds::frame_bytes(VDS_FRAME_USB_FEATURE_REPLY,
-                                          port.feature_cache[report_id]);
-      (void)write_vds_frame(port, frame, output_trace, logger);
-      if (output_trace) {
-        trace_output_latency(
-            port.path, "feature_get", port.trace_state.output_feature_latency,
-            Clock::now() - start, kOutputTraceFeatureSlowWarn, logger);
-      }
-      return;
-    }
-    if (bt_backend) {
-      port.pending_feature_reports.push_back(report_id);
-      bt_backend->send_feature_get(report_id);
-    }
-    if (output_trace) {
-      trace_output_latency(
-          port.path, "feature_get", port.trace_state.output_feature_latency,
-          Clock::now() - start, kOutputTraceFeatureSlowWarn, logger);
-    }
-    return;
-  }
-
-  if (header.type == VDS_FRAME_USB_FEATURE_SET) {
-    const auto start = Clock::now();
-    if (payload.empty()) {
-      return;
-    }
-    const std::uint8_t report_id = payload[0];
-    if (port.persona != vds::HostPersona::DualSense) {
-      // Persona feature writes (DS4 probes) must not reach the DualSense.
-      return;
-    }
-    if (output_trace) {
-      logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                 port.path + " feature set report=" + hex_u8(report_id) +
-                     " len=" + std::to_string(payload.size()) +
-                     " forwarded=" + (bt_backend ? "yes" : "no"));
-      logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                 port.path + " feature set payload=" +
-                     hex_bytes(payload, kTraceDumpMaxBytes));
-    }
-    if (payload.size() >= 3 && payload[0] == kTestCommandReportId) {
-      std::size_t command_offset = 1;
-      if (payload.size() > command_offset &&
-          payload[command_offset] == kTestCommandReportId) {
-        ++command_offset;
-      }
-      if (payload.size() > command_offset + 1) {
-        const std::uint8_t command_device = payload[command_offset];
-        const std::uint8_t command_action = payload[command_offset + 1];
-        const std::size_t command_data_offset = command_offset + 2;
-
-        std::array<std::uint8_t, VDS_USB_INPUT_REPORT_SIZE> test_result{};
-        test_result[0] = kTestCommandResultReportId;
-        test_result[1] = command_device;
-        test_result[2] = command_action;
-        test_result[3] = kTestCommandCompleteStatus;
-        cache_feature_report(port, test_result, output_trace, logger);
-        if (output_trace) {
-          logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-                     port.path + " cached WebHID test result device=" +
-                         hex_u8(command_device) + " action=" +
-                         hex_u8(command_action) + " status=complete");
-        }
-
-        if (command_device == kTestCommandAudioDevice &&
-            command_action == kTestCommandWaveoutPrepare) {
-          port.speaker_waveout_selected =
-              payload.size() > command_data_offset + 2 &&
-              payload[command_data_offset + 2] == kTestCommandSpeakerParam;
-          if (output_trace) {
-            logger.log(vds::LogScope::Output, vds::LogLevel::Debug,
-                       port.path + " WebHID waveout target=" +
-                           std::string(port.speaker_waveout_selected
-                                           ? "speaker"
-                                           : "headphone"));
-          }
-        } else if (command_device == kTestCommandAudioDevice &&
-                   command_action == kTestCommandWaveoutControl &&
-                   payload.size() > command_data_offset) {
-          const bool enable = payload[command_data_offset] != 0;
-          const bool speaker_waveout = enable && port.speaker_waveout_selected;
-          port.speaker_waveout_active = speaker_waveout;
-          port.speaker_waveout_phase = 0;
-          port.waveout_extractor =
-              vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
-          port.output_state.set_audio_out_stream_active(speaker_waveout,
-                                                        port.headset_plugged);
-          port.audio_out_stream_active = speaker_waveout;
-          if (!speaker_waveout) {
-            port.pending_audio_chunks.clear();
-            port.audio_primed = false;
-          }
-          if (bt_backend) {
-            forward_bt_state_if_changed(port, *bt_backend, trace_flags, logger,
-                                        speaker_waveout
-                                            ? "WebHID speaker waveout route on"
-                                            : "WebHID waveout route off");
-          }
-          if (output_trace) {
-            logger.log(vds::LogScope::Output, vds::LogLevel::Info,
-                       port.path + " WebHID waveout " +
-                           std::string(enable ? "on" : "off") + " target=" +
-                           std::string(port.speaker_waveout_selected
-                                           ? "speaker"
-                                           : "headphone") +
-                           " synthesized=" + (speaker_waveout ? "yes" : "no"));
-          }
-        }
-      }
-    }
-    if (bt_backend) {
-      bt_backend->send_feature_set(payload);
-    }
-    if (output_trace) {
-      trace_output_latency(
-          port.path, "feature_set", port.trace_state.output_feature_latency,
-          Clock::now() - start, kOutputTraceFeatureSlowWarn, logger);
-    }
-    return;
-  }
-
-  if (header.type != VDS_FRAME_USB_AUDIO_OUT) {
-    return;
-  }
-
-  if (!bt_backend) {
-    return;
-  }
-
-  std::size_t queued_chunks = 0;
-  std::size_t dropped_chunks = 0;
-  const auto audio_start = Clock::now();
-  const auto extract_start = Clock::now();
-  port.extractor.set_speaker_boost_db(speaker_boost_db(port));
-  port.extractor.set_speaker_volume_percent(speaker_volume_percent(port));
-  port.extractor.set_haptics_gain_percent(port.haptics_gain_percent);
-  port.extractor.set_speaker_mono(!port.headset_plugged);
-  const auto chunks = port.extractor.push_usb_audio(payload);
-  const auto extract_duration = Clock::now() - extract_start;
-  for (const auto &chunk : chunks) {
-    if (output_trace) {
-      if (chunk.has_haptics_signal) {
-        if (!port.trace_state.haptics_burst_active) {
-          logger.log(vds::LogScope::Output, vds::LogLevel::Debug,
-                     port.path + " haptics burst start");
-          port.trace_state.haptics_burst_active = true;
-          port.trace_state.haptics_burst_chunks = 0;
-        }
-        ++port.trace_state.haptics_burst_chunks;
-      } else if (port.trace_state.haptics_burst_active) {
-        logger.log(vds::LogScope::Output, vds::LogLevel::Debug,
-                   port.path + " haptics burst end chunks=" +
-                       std::to_string(port.trace_state.haptics_burst_chunks));
-        port.trace_state.haptics_burst_active = false;
-        port.trace_state.haptics_burst_chunks = 0;
-      }
-    }
-
-    /*
-     * USB isochronous URBs can arrive in bursts. Queue completed 0x36 audio
-     * chunks here and let flush_pending_outputs() send them at the
-     * kAudioOutputInterval speaker frame interval, otherwise speaker/haptics audio turns into
-     * audible bursts.
-     */
-    if (port.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
-      port.pending_audio_chunks.pop_front();
-      ++dropped_chunks;
-      ++port.trace_state.dropped_audio_haptics_count;
-      ++port.trace_state.queue_dropped_audio_haptics_count;
-    }
-
-    port.pending_audio_chunks.push_back(chunk);
-    ++queued_chunks;
-  }
-  if (dropped_chunks > 0 &&
-      (port.trace_state.dropped_audio_haptics_count == dropped_chunks ||
-       port.trace_state.dropped_audio_haptics_count % 1000 == 0)) {
-    logger.log(
-        vds::LogScope::Output, vds::LogLevel::Warn,
-        port.path + " dropped BT 0x36 haptics packets count=" +
-            std::to_string(port.trace_state.dropped_audio_haptics_count) +
-            " queue=" +
-            std::to_string(port.trace_state.queue_dropped_audio_haptics_count) +
-            " blocked=" +
-            std::to_string(port.trace_state.blocked_audio_haptics_count));
-  }
-  if (output_trace && queued_chunks > 0) {
-    logger.log(
-        vds::LogScope::Output, vds::LogLevel::Debug,
-        port.path + " audio out queued " + std::to_string(queued_chunks) +
-            " BT 0x36 haptics packets pending=" +
-            std::to_string(port.pending_audio_chunks.size()) +
-            " extract_encode_us=" +
-            std::to_string(duration_us(extract_duration)) + " total_us=" +
-            std::to_string(duration_us(Clock::now() - audio_start)));
-  }
-  if (output_trace) {
-    trace_output_latency(
-        port.path, "audio_out", port.trace_state.output_audio_latency,
-        Clock::now() - audio_start, kOutputTraceSlowWarn, logger);
-    trace_output_latency(port.path, "audio_extract_encode",
-                         port.trace_state.output_audio_extract_latency,
-                         extract_duration, kOutputTraceSlowWarn, logger);
-  }
+  LinuxBridgeBluetooth bt(*bt_backend);
+  vds::bridge_handle_usb_frame(port, header.type, payload, &bt, usb,
+                               trace_flags, logger);
 }
 
 bool handle_vds_frame(VirtualPort &port, vds::BtL2capBackend *bt_backend,
@@ -1281,318 +474,19 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
     return false;
   }
 
-  if (vds::bt_input_payload_type(*packet) == vds::BtInputPayloadType::Audio) {
-    const bool input_audio_trace = trace_enabled(trace_flags, kTraceInputAudio);
-    ++port.trace_state.bt_mic_packet_count;
-    if (!port.audio_in_stream_active) {
-      ++port.trace_state.bt_mic_drop_count;
-      // The mic should be closed: tell the controller again so it stops
-      // using airtime on mic packets nobody reads.
-      AudioStats &stats = port.audio_stats;
-      ++stats.mic_while_closed_total;
-      if (read_time - stats.last_mic_close_resend >= std::chrono::seconds(1)) {
-        stats.last_mic_close_resend = read_time;
-        const bool sent = bt_backend.try_send_output_report(
-            port.output_state.build_bt_mic_report(
-                false, std::max(stats.buffer_length, kMicBufferLength)));
-        logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
-                   port.path + " mic packets while closed, re-sent close sent=" +
-                       (sent ? "yes" : "no"));
-      }
-      if (input_audio_trace &&
-          (port.trace_state.bt_mic_drop_count == 1 ||
-           port.trace_state.bt_mic_drop_count % 1000 == 0)) {
-        logger.log(vds::LogScope::InputAudio, vds::LogLevel::Debug,
-                   port.path + " dropped mic packet count=" +
-                       std::to_string(port.trace_state.bt_mic_drop_count) +
-                       " reason=audio_in_stream_off");
-      }
-      return true;
-    }
-
-    const auto opus_payload = vds::bt_mic_opus_payload(*packet);
-    if (!opus_payload) {
-      ++port.trace_state.bt_mic_decode_fail_count;
-      if (input_audio_trace) {
-        logger.log(vds::LogScope::InputAudio, vds::LogLevel::Warn,
-                   port.path + " malformed mic packet len=" +
-                       std::to_string(packet->size()));
-      }
-      return true;
-    }
-
-    ++port.audio_stats.mic_packets_total;
-    ++port.audio_stats.window_mic_packets;
-    if (!port.mic_first_packet) {
-      port.mic_first_packet = true;
-      port.audio_stats.mic_startup_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              read_time - port.mic_opened_at)
-              .count();
-      logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
-                 port.path + " controller mic first packet after " +
-                     std::to_string(port.audio_stats.mic_startup_ms) +
-                     " ms, open re-sent " +
-                     std::to_string(port.mic_open_resends) + " times");
-    }
-    try {
-      auto pcm = port.mic_decoder.decode(*opus_payload);
-      port.trace_state.mic_peak_permille =
-          vds::scale_mic_pcm(pcm, g_mic_volume_percent, port.mic_muted);
-      if (!port.mic_first_sound &&
-          port.trace_state.mic_peak_permille >= kMicSoundPermille) {
-        port.mic_first_sound = true;
-        port.audio_stats.mic_first_sound_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                read_time - port.mic_opened_at)
-                .count();
-        logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
-                   port.path + " controller mic first sound after " +
-                       std::to_string(port.audio_stats.mic_first_sound_ms) +
-                       " ms");
-      }
-      port.trace_state.mic_last_decoded_bytes =
-          static_cast<std::uint16_t>(pcm.size());
-      if (!port.audio_in_requested) {
-        return true; // mic kept ready; nothing is recording
-      }
-      const auto frame = vds::frame_bytes(VDS_FRAME_USB_AUDIO_IN, pcm);
-      const bool wrote =
-          write_vds_frame(port, frame, input_audio_trace, logger);
-      ++port.trace_state.audio_in_forward_count;
-      if (!wrote) {
-        ++port.trace_state.audio_in_write_short_count;
-      }
-      if (input_audio_trace && (port.trace_state.audio_in_forward_count == 1 ||
-                                port.trace_state.audio_in_forward_count %
-                                        kInputTraceSummaryInterval ==
-                                    0)) {
-        logger.log(vds::LogScope::InputAudio, vds::LogLevel::Debug,
-                   port.path + " mic forwarded count=" +
-                       std::to_string(port.trace_state.audio_in_forward_count) +
-                       " len=" + std::to_string(pcm.size()) +
-                       " written=" + (wrote ? "yes" : "no"));
-      }
-    } catch (const std::exception &error) {
-      ++port.trace_state.bt_mic_decode_fail_count;
-      if (input_audio_trace) {
-        logger.log(
-            vds::LogScope::InputAudio, vds::LogLevel::Warn,
-            port.path + " mic decode failed count=" +
-                std::to_string(port.trace_state.bt_mic_decode_fail_count) +
-                ": " + error.what());
-      }
-    }
-    return true;
-  }
-
-  auto report = vds::bt_input_to_usb_input(*packet);
-  if (!report) {
-    // Not controller input or mic audio. Logged without tracing so an
-    // unexpected header shows up if input ever stops.
-    if (packet->size() < 2 || (*packet)[1] != VDS_BT_STATE_REPORT_ID) {
-      return true; // e.g. the basic 0x01 report sent once at connect
-    }
-    ++port.trace_state.bt_input_unknown_count;
-    if (port.trace_state.bt_input_unknown_count == 1 ||
-        port.trace_state.bt_input_unknown_count % 1000 == 0) {
-      logger.log(vds::LogScope::InputControl, vds::LogLevel::Warn,
-                 port.path + " ignored BT input packet count=" +
-                     std::to_string(port.trace_state.bt_input_unknown_count) +
-                     " len=" + std::to_string(packet->size()) + " head=" +
-                     hex_bytes(*packet, 4));
-    }
-    return true;
-  }
-  // Idle Disconnect, checked on the raw report (before shortcuts or remapping
-  // hide buttons). Turning the controller off drops the link like the
-  // companion's Turn Off; the normal hang-up path then cleans up.
-  if (port.last_input_activity == Clock::time_point{} ||
-      vds::controller_input_active(*report)) {
-    port.last_input_activity = read_time;
-  } else if (companion.settings.idle_disconnect_enabled &&
-             read_time - port.last_input_activity >
-                 std::chrono::minutes(
-                     companion.settings.idle_disconnect_timeout_minutes)) {
-    port.last_input_activity = read_time;
-    logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
-               "idle for " +
-                   std::to_string(companion.settings.idle_disconnect_timeout_minutes) +
-                   " min; turning controller off address=" +
-                   bt_backend.address());
+  LinuxBridgeBluetooth bt(bt_backend);
+  LinuxBridgeUsb usb(port);
+  const vds::BridgeInputResult result = vds::bridge_handle_bt_input(
+      port, *packet, read_time, bt, usb, companion, trace_flags, logger);
+  if (result.idle_timeout) {
+    // Turning the controller off drops the link like the companion's Turn
+    // Off; the normal hang-up path then cleans up.
     try {
       (void)vds::disconnect_bluez_device(bt_backend.address());
     } catch (const std::exception &error) {
       logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,
                  "idle turn off failed address=" + bt_backend.address() +
                      " error=" + error.what());
-    }
-  }
-  vds::companion_translate_input(companion, port.companion_input,
-                                 std::span<std::uint8_t>(*report));
-  // USB input payload offset 52 (report byte 53) carries the DualSense
-  // power status: low nibble battery capacity 0-10, high nibble state.
-  port.battery_status = (*report)[53];
-
-  const bool input_trace = trace_enabled(trace_flags, kTraceInputControl);
-  if (input_trace) {
-    ++port.trace_state.bt_input_count;
-    if (port.trace_state.have_last_input_time) {
-      const auto gap = read_time - port.trace_state.last_input_time;
-      const auto gap_us = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::microseconds>(gap).count());
-      port.trace_state.input_gap_max_us =
-          std::max(port.trace_state.input_gap_max_us, gap_us);
-      if (gap >= kInputTraceGapWarn) {
-        logger.log(vds::LogScope::InputControl, vds::LogLevel::Warn,
-                   port.path + " input gap count=" +
-                       std::to_string(port.trace_state.bt_input_count) +
-                       " gap_us=" + std::to_string(gap_us));
-      }
-    }
-    port.trace_state.last_input_time = read_time;
-    port.trace_state.have_last_input_time = true;
-
-    const std::span buttons(report->data() + kUsbInputButtonsOffset,
-                            kUsbInputButtonsSize);
-    const bool buttons_changed =
-        !port.trace_state.have_last_input_buttons ||
-        !std::equal(buttons.begin(), buttons.end(),
-                    port.trace_state.last_input_buttons.begin());
-    if (buttons_changed) {
-      std::copy(buttons.begin(), buttons.end(),
-                port.trace_state.last_input_buttons.begin());
-      port.trace_state.have_last_input_buttons = true;
-      logger.log(vds::LogScope::InputControl, vds::LogLevel::Debug,
-                 port.path + " buttons changed raw=" +
-                     hex_bytes(buttons, kUsbInputButtonsSize));
-    }
-  }
-
-  const std::uint8_t headset_status = report->at(kUsbInputHeadsetOffset);
-  const bool headset_plugged =
-      (headset_status & kUsbInputHeadphonesPluggedMask) != 0;
-  const bool headset_mic_plugged =
-      (headset_status & kUsbInputMicPluggedMask) != 0;
-  const bool mute_button_down =
-      (report->at(kUsbInputMuteButtonOffset) & kUsbInputMuteButtonMask) != 0;
-  bool headset_mic_changed = false;
-  bool mic_mute_changed = false;
-  bool output_state_changed = false;
-  // Mute switches the mic on/off (pass-through + mute together, like the
-  // app's Microphone switch) unless the Mute button mode is Chord (Mute starts
-  // chords); vdsd has no keyboard/quiet modes, so those act as Normal. The app
-  // follows through the status report (mic muted = mic off).
-  constexpr std::uint8_t kMuteButtonModeChord = 3;
-  if (mute_button_down && !port.mute_button_down &&
-      companion.settings.mute_button_mode != kMuteButtonModeChord) {
-    const bool mic_on = !(g_mic_allowed && !g_mic_muted);
-    companion.settings.duplex_enabled = mic_on;
-    companion.settings.mic_muted = !mic_on;
-    ++companion.settings_revision;
-    g_mic_allowed = g_mic_forced || mic_on;
-    g_mic_muted = !mic_on;
-    mic_mute_changed = true;
-    // DS5 Bridge MIC_MUTE_ON (0x04) / MIC_MUTE_OFF (0x05) input events.
-    if (companion.pending_input_events.size() <
-        vds::kCompanionMaxPendingInputEvents) {
-      companion.pending_input_events.push_back(mic_on ? 0x05 : 0x04);
-    }
-  }
-  port.mute_button_down = mute_button_down;
-  if (headset_mic_plugged != port.headset_mic_plugged) {
-    port.headset_mic_plugged = headset_mic_plugged;
-    headset_mic_changed = true;
-  }
-  if (mic_mute_changed) {
-    sync_port_mic(port, &bt_backend, logger);
-    forward_bt_state_if_changed(port, bt_backend, trace_flags, logger,
-                                "mic mute");
-    logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
-               port.path + " mic " +
-                   std::string(g_mic_allowed && !g_mic_muted ? "on" : "off") +
-                   " (Mute button)");
-  } else if (headset_mic_changed && port.audio_in_stream_active) {
-    bt_backend.try_send_output_report(
-        port.output_state.build_bt_mic_state_report(true, port.mic_muted));
-  }
-  if (headset_plugged != port.headset_plugged) {
-    port.headset_plugged = headset_plugged;
-    if (port.audio_out_stream_active || port.speaker_waveout_active) {
-      port.output_state.set_audio_out_stream_active(true, port.headset_plugged);
-      output_state_changed = true;
-    }
-    logger.log(vds::LogScope::Output, vds::LogLevel::Info,
-               port.path + (port.headset_plugged
-                                ? " headphones plugged in; stereo, "
-                                  "speaker boost off"
-                                : " headphones unplugged; mono speaker, "
-                                  "boost on"));
-  }
-  if (output_state_changed) {
-    forward_bt_state_if_changed(port, bt_backend, trace_flags, logger,
-                                "headset route change");
-  }
-  if (headset_mic_changed && input_trace) {
-    logger.log(
-        vds::LogScope::InputControl, vds::LogLevel::Info,
-        port.path + " headset mic " +
-            std::string(port.headset_mic_plugged ? "plugged" : "unplugged"));
-  }
-
-  // DualShock 4 / Xbox 360 personas get the DualSense report translated.
-  std::span<const std::uint8_t> host_report(*report);
-  const std::vector<std::uint8_t> persona_report = vds::persona_input_report(
-      port.persona, host_report, port.persona_state);
-  if (!persona_report.empty()) {
-    host_report = persona_report;
-  }
-
-  vds_frame_header header{};
-  header.type = VDS_FRAME_USB_HID_IN;
-  header.length = static_cast<std::uint32_t>(host_report.size());
-
-  std::array<std::uint8_t, sizeof(header) + vds::kUsbInputReportSize> frame{};
-  std::memcpy(frame.data(), &header, sizeof(header));
-  std::memcpy(frame.data() + sizeof(header), host_report.data(),
-              host_report.size());
-  const std::span bytes(frame.data(), sizeof(header) + host_report.size());
-
-  const auto write_start = Clock::now();
-  const bool wrote = write_vds_frame(port, bytes, input_trace, logger);
-  const auto write_duration = Clock::now() - write_start;
-  if (input_trace) {
-    const auto write_us = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(write_duration)
-            .count());
-    ++port.trace_state.input_write_count;
-    port.trace_state.input_write_total_us += write_us;
-    port.trace_state.input_write_max_us =
-        std::max(port.trace_state.input_write_max_us, write_us);
-
-    if (write_duration >= kInputTraceSlowWriteWarn) {
-      logger.log(vds::LogScope::InputControl, vds::LogLevel::Warn,
-                 port.path + " slow input write count=" +
-                     std::to_string(port.trace_state.bt_input_count) +
-                     " write_us=" + std::to_string(write_us) +
-                     " written=" + (wrote ? "yes" : "no"));
-    }
-    if (port.trace_state.bt_input_count == 1 ||
-        port.trace_state.bt_input_count % kInputTraceSummaryInterval == 0) {
-      const std::uint64_t avg_write_us =
-          port.trace_state.input_write_count == 0
-              ? 0
-              : port.trace_state.input_write_total_us /
-                    port.trace_state.input_write_count;
-      logger.log(vds::LogScope::InputControl, vds::LogLevel::Debug,
-                 port.path + " input summary count=" +
-                     std::to_string(port.trace_state.bt_input_count) +
-                     " len=" + std::to_string(report->size()) +
-                     " avg_write_us=" + std::to_string(avg_write_us) +
-                     " max_write_us=" +
-                     std::to_string(port.trace_state.input_write_max_us) +
-                     " max_gap_us=" +
-                     std::to_string(port.trace_state.input_gap_max_us));
     }
   }
   return true;
@@ -1604,31 +498,8 @@ bool handle_bt_control(VirtualPort &port, vds::BtL2capBackend &bt_backend,
   if (!report) {
     return false;
   }
-  if (report->empty()) {
-    return true;
-  }
-
-  const std::uint8_t report_id = (*report)[0];
-  port.feature_cache[report_id] = *report;
-  port.feature_cached[report_id] = true;
-
-  const auto pending = std::find(port.pending_feature_reports.begin(),
-                                 port.pending_feature_reports.end(), report_id);
-  const bool usb_waiting = pending != port.pending_feature_reports.end();
-  const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
-  if (output_trace) {
-    logger.log(vds::LogScope::Hid, vds::LogLevel::Debug,
-               port.path + " bt feature cached report=" + hex_u8(report_id) +
-                   " len=" + std::to_string(report->size()) +
-                   " usb_waiting=" + (usb_waiting ? "yes" : "no"));
-  }
-  if (!usb_waiting) {
-    return true;
-  }
-
-  port.pending_feature_reports.erase(pending);
-  const auto frame = vds::frame_bytes(VDS_FRAME_USB_FEATURE_REPLY, *report);
-  (void)write_vds_frame(port, frame, output_trace, logger);
+  LinuxBridgeUsb usb(port);
+  vds::bridge_handle_feature_reply(port, *report, usb, trace_flags, logger);
   return true;
 }
 
@@ -1667,7 +538,8 @@ void initialize_bt_controller(vds::BtL2capBackend &bt_backend,
         continue;
       }
 
-      cache_feature_report(port, *report, false, logger);
+      LinuxBridgeUsb usb(port);
+      vds::bridge_cache_feature_report(port, *report, usb, false, logger);
       if ((*report)[0] == report_id) {
         break;
       }
@@ -1838,27 +710,10 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
                        " path=" + device;
     }
     logger.log(vds::LogScope::Port, driver_log_level, driver_message);
-    updated.push_back(VirtualPort{
-        .path = device,
-        .fd = std::move(fd),
-        .extractor = vds::PcmAudioExtractor{kLinuxSpeakerInputFrames},
-        .waveout_extractor =
-            vds::PcmAudioExtractor{kLinuxSpeakerInputFrames},
-        .haptics_builder = {},
-        .output_state = {},
-        .pending_audio_chunks = {},
-        .last_sent_bt_state = std::nullopt,
-        .pending_bt_state = std::nullopt,
-        .pending_bt_state_report = std::nullopt,
-        .next_haptics_send_time = {},
-        .speaker_waveout_selected = true,
-        .speaker_waveout_active = false,
-        .speaker_waveout_phase = 0,
-        .feature_cache = {},
-        .feature_cached = {},
-        .pending_feature_reports = {},
-        .trace_state = {},
-    });
+    VirtualPort port;
+    port.path = device;
+    port.fd = std::move(fd);
+    updated.push_back(std::move(port));
   }
 
   for (std::size_t i = 0; i < ports.size(); ++i) {
@@ -1918,7 +773,7 @@ void complete_pending_controller(ControllerRuntime &controller,
                                 std::move(controller.pending_interrupt_fd));
 
   reset_virtual_port(port);
-  port.persona = g_host_persona;
+  port.persona = vds::bridge_settings().host_persona;
   port.persona_state = {};
   ioctl_noarg(port.fd.get(), VDS_IOC_DISCONNECT, "VDS_IOC_DISCONNECT");
   ioctl_set_profile(port.fd.get(),
@@ -2048,17 +903,6 @@ void handle_bt_accept(std::vector<VirtualPort> &ports,
   }
 }
 
-/*
- * After the queue runs dry, hold sending until kAudioPrimeChunks are buffered.
- * The WebHID waveout generator only queues one chunk at a time, so it is
- * exempt.
- */
-bool audio_chunk_ready(const VirtualPort &port) {
-  const std::size_t needed =
-      port.audio_primed || port.speaker_waveout_active ? 1 : kAudioPrimeChunks;
-  return port.pending_audio_chunks.size() >= needed;
-}
-
 int next_wakeup_timeout_ms(std::span<const VirtualPort> ports,
                            std::span<const ControllerRuntime> controllers) {
   const auto now = Clock::now();
@@ -2071,244 +915,11 @@ int next_wakeup_timeout_ms(std::span<const VirtualPort> ports,
     if (!port_index) {
       continue;
     }
-    const auto &port = ports[*port_index];
-    const bool audio_due =
-        audio_chunk_ready(port) || port.speaker_waveout_active;
-    if (!audio_due) {
-      if (!port.pending_bt_state_report) {
-        continue;
-      }
-      timeout_ms = std::min(timeout_ms, kPendingOutputPollMs);
-      continue;
-    }
-
-    const auto next_time = port.next_haptics_send_time;
-    if (next_time == Clock::time_point{} || next_time <= now) {
-      return 0;
-    }
-    const auto audio_wait =
-        std::chrono::ceil<std::chrono::milliseconds>(next_time - now);
-    timeout_ms = std::min(timeout_ms, static_cast<int>(audio_wait.count()));
-    if (port.pending_bt_state_report) {
-      timeout_ms = std::min(timeout_ms, kPendingOutputPollMs);
+    if (const auto wait = vds::bridge_wakeup_ms(ports[*port_index], now)) {
+      timeout_ms = std::min(timeout_ms, *wait);
     }
   }
   return timeout_ms;
-}
-
-bool flush_pending_audio_chunk(VirtualPort &port,
-                               vds::BtL2capBackend &bt_backend,
-                               std::uint32_t trace_flags, vds::Logger &logger) {
-  if (port.pending_audio_chunks.empty()) {
-    if (port.audio_primed) {
-      // Ran dry mid-stream: the next packets wait for a refill.
-      ++port.audio_stats.refills_total;
-      ++port.audio_stats.window_refills;
-    }
-    port.audio_primed = false;
-    return true;
-  }
-  if (!audio_chunk_ready(port)) {
-    return true;
-  }
-
-  const auto now = Clock::now();
-  if (port.next_haptics_send_time != Clock::time_point{} &&
-      now < port.next_haptics_send_time) {
-    return true;
-  }
-
-  if (!port.audio_primed) {
-    port.queue_trimmer.reset();
-  }
-  if (port.queue_trimmer.should_trim(port.pending_audio_chunks.size())) {
-    // A standing backlog is pure haptics latency: skip one chunk to drain it.
-    port.pending_audio_chunks.pop_front();
-    ++port.audio_stats.trims_total;
-  }
-
-  const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
-  const auto &chunk = port.pending_audio_chunks.front();
-  // Haptics gain is applied by the extractor before 8-bit quantization.
-  // Four packet kinds, the smallest that carries what is live: 0x33 when the
-  // speaker is silent, 0x36 with speaker audio, each with the mic section
-  // enabled only while the mic records (buffer at least the mic's length).
-  const bool mic_open = port.audio_in_stream_active;
-  port.haptics_builder.set_buffer_length(
-      mic_open ? std::max(port.audio_stats.buffer_length, kMicBufferLength)
-               : port.audio_stats.buffer_length);
-  const bool haptics_only =
-      !port.speaker_waveout_active &&
-      port.silent_speaker_packets >= kHapticsOnlyAfterSilentPackets &&
-      !chunk.has_speaker_signal;
-  const auto send_start = Clock::now();
-  const bool sent =
-      haptics_only
-          ? bt_backend.try_send_output_report(
-                port.haptics_builder.build_haptics_only_packet(
-                    chunk.haptics, port.output_state.state(), mic_open,
-                    port.headset_plugged))
-          : bt_backend.try_send_output_report(port.haptics_builder.build_packet(
-                chunk.haptics, chunk.speaker, port.output_state.state(), mic_open,
-                port.headset_plugged));
-  if (!sent) {
-    ++port.trace_state.dropped_audio_haptics_count;
-    ++port.trace_state.blocked_audio_haptics_count;
-    port.next_haptics_send_time = Clock::now() + kHapticsOutputBlockedRetry;
-    if (output_trace &&
-        (port.trace_state.blocked_audio_haptics_count == 1 ||
-         port.trace_state.blocked_audio_haptics_count % 1000 == 0)) {
-      logger.log(
-          vds::LogScope::Output, vds::LogLevel::Warn,
-          port.path + " pending BT 0x36 haptics packet still blocked count=" +
-              std::to_string(port.trace_state.blocked_audio_haptics_count));
-    }
-    return false;
-  }
-
-  const auto send_duration = Clock::now() - send_start;
-  port.silent_speaker_packets =
-      chunk.has_speaker_signal
-          ? 0
-          : std::min(port.silent_speaker_packets + 1,
-                     kHapticsOnlyAfterSilentPackets);
-  port.audio_stats.haptics_only = haptics_only;
-  if (haptics_only) {
-    ++port.audio_stats.haptics_only_total;
-  }
-  port.pending_audio_chunks.pop_front();
-  port.audio_primed = true;
-  // 0x36 packets omit mic fields, so a pending mic mute/unmute still needs
-  // its own 0x31 state report.
-  port.last_sent_bt_state = vds::state_after_audio_packet(
-      port.last_sent_bt_state, port.output_state.state());
-  if (port.pending_bt_state &&
-      *port.pending_bt_state == *port.last_sent_bt_state) {
-    port.pending_bt_state.reset();
-    port.pending_bt_state_report.reset();
-  }
-  // Step from the previous deadline to keep the packet cadence without
-  // accumulating epoll wakeup rounding. A slightly late send catches up on the
-  // next wakeup; one more than kMaxAudioCatchup late resyncs to now instead of
-  // replaying a backlog.
-  const auto sent_at = Clock::now();
-  AudioStats &stats = port.audio_stats;
-  if (stats.last_send != Clock::time_point{}) {
-    const auto gap = sent_at - stats.last_send;
-    // Longer pauses are the stream stopping, not a late packet.
-    if (gap < std::chrono::seconds(1)) {
-      const auto gap_us =
-          std::chrono::duration_cast<std::chrono::microseconds>(gap).count();
-      stats.window_max_gap_us = std::max<std::int64_t>(stats.window_max_gap_us, gap_us);
-      const auto buffer_us =
-          static_cast<std::int64_t>(stats.buffer_length) * 1000000 /
-          VDS_HAPTICS_SAMPLE_RATE;
-      if (gap_us > buffer_us) {
-        ++stats.late_total;
-        ++stats.window_late;
-      }
-      if (stats.buffer_auto) {
-        stats.buffer_length = port.buffer_tuner.on_send(gap_us);
-        port.haptics_builder.set_buffer_length(stats.buffer_length);
-      }
-    }
-  }
-  stats.last_send = sent_at;
-  ++stats.packets_total;
-  ++stats.window_packets;
-  auto next_deadline = port.next_haptics_send_time;
-  if (next_deadline == Clock::time_point{}) {
-    next_deadline = send_start;
-  }
-  next_deadline += kAudioOutputInterval;
-  if (sent_at - next_deadline > kMaxAudioCatchup) {
-    next_deadline = sent_at + kAudioOutputInterval;
-  }
-  port.next_haptics_send_time = next_deadline;
-
-  if (output_trace) {
-    trace_output_latency(port.path, "audio_bt_send",
-                         port.trace_state.output_audio_send_latency,
-                         send_duration, kOutputTraceSlowWarn, logger);
-  }
-  return true;
-}
-
-void enqueue_speaker_waveout_chunk(VirtualPort &port, std::uint32_t trace_flags,
-                                   vds::Logger &logger) {
-  if (!port.speaker_waveout_active || !port.pending_audio_chunks.empty()) {
-    return;
-  }
-
-  std::array<std::uint8_t,
-             vds::kPcmWindowFrames * VDS_AUDIO_CHANNELS * sizeof(std::int16_t)>
-      pcm{};
-  for (std::size_t frame = 0; frame < vds::kPcmWindowFrames; ++frame) {
-    const double angle = kSpeakerWaveoutTwoPi *
-                         static_cast<double>(port.speaker_waveout_phase) /
-                         static_cast<double>(kSpeakerWaveoutPeriodFrames);
-    const auto sample = static_cast<std::int16_t>(
-        std::sin(angle) * static_cast<double>(kSpeakerWaveoutAmplitude));
-    port.speaker_waveout_phase =
-        (port.speaker_waveout_phase + 1) % kSpeakerWaveoutPeriodFrames;
-
-    for (std::size_t channel = 0; channel < vds::kSpeakerChannels; ++channel) {
-      const std::size_t offset =
-          (frame * VDS_AUDIO_CHANNELS + channel) * sizeof(std::int16_t);
-      const auto value = static_cast<std::uint16_t>(sample);
-      pcm[offset + 0] = static_cast<std::uint8_t>(value & 0xff);
-      pcm[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xff);
-    }
-  }
-
-  port.waveout_extractor.set_speaker_boost_db(speaker_boost_db(port));
-  port.waveout_extractor.set_speaker_volume_percent(
-      speaker_volume_percent(port));
-  port.waveout_extractor.set_haptics_gain_percent(port.haptics_gain_percent);
-  port.waveout_extractor.set_speaker_mono(!port.headset_plugged);
-  const auto chunks = port.waveout_extractor.push_usb_audio(pcm);
-  for (const auto &chunk : chunks) {
-    if (port.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
-      break;
-    }
-    port.pending_audio_chunks.push_back(chunk);
-  }
-  if (trace_enabled(trace_flags, kTraceOutput) && !chunks.empty()) {
-    logger.log(vds::LogScope::Output, vds::LogLevel::Debug,
-               port.path + " queued WebHID speaker waveout chunk pending=" +
-                   std::to_string(port.pending_audio_chunks.size()));
-  }
-}
-
-// Re-sends the controller mic open until its first packet arrives.
-void retry_mic_open(VirtualPort &port, vds::BtL2capBackend &bt_backend,
-                    vds::Logger &logger) {
-  if (!port.audio_in_stream_active || port.mic_first_packet ||
-      port.mic_open_resends >= kMicOpenMaxResends) {
-    return;
-  }
-  const auto now = Clock::now();
-  if (now - port.mic_open_resent_at < kMicOpenRetry) {
-    return;
-  }
-  port.mic_open_resent_at = now;
-  ++port.mic_open_resends;
-  bt_backend.try_send_output_report(
-      port.output_state.build_bt_mic_state_report(true, port.mic_muted));
-  const bool sent = bt_backend.try_send_output_report(
-      port.output_state.build_bt_mic_report(
-          true, std::max(port.audio_stats.buffer_length, kMicBufferLength)));
-  logger.log(vds::LogScope::InputAudio, vds::LogLevel::Debug,
-             port.path + " controller mic open re-sent count=" +
-                 std::to_string(port.mic_open_resends) +
-                 " sent=" + (sent ? "yes" : "no"));
-}
-
-bool mic_open_retry_pending(const std::vector<VirtualPort> &ports) {
-  return std::any_of(ports.begin(), ports.end(), [](const VirtualPort &port) {
-    return port.audio_in_stream_active && !port.mic_first_packet &&
-           port.mic_open_resends < kMicOpenMaxResends;
-  });
 }
 
 void flush_pending_outputs(std::vector<VirtualPort> &ports,
@@ -2332,14 +943,15 @@ void flush_pending_outputs(std::vector<VirtualPort> &ports,
 
     try {
       auto &port = ports[*port_index];
-      if (!flush_pending_bt_state_report(port, *controller.backend, trace_flags,
-                                         logger)) {
+      LinuxBridgeBluetooth state_bt(*controller.backend);
+      if (!vds::bridge_flush_pending_state(port, state_bt, trace_flags,
+                                           logger)) {
         continue;
       }
-      retry_mic_open(port, *controller.backend, logger);
-      enqueue_speaker_waveout_chunk(port, trace_flags, logger);
-      (void)flush_pending_audio_chunk(port, *controller.backend, trace_flags,
-                                      logger);
+      LinuxBridgeBluetooth bt(*controller.backend);
+      vds::bridge_retry_mic_open(port, bt, logger);
+      vds::bridge_enqueue_waveout(port, trace_flags, logger);
+      (void)vds::bridge_flush_audio(port, bt, trace_flags, logger);
     } catch (const std::exception &error) {
       if (!is_bluetooth_error(error)) {
         throw;
@@ -2955,21 +1567,16 @@ std::string handle_daemon_log_request(std::span<const vds::JsonlField> fields,
  * Diagnostics view. Window counters cover the time since the previous
  * request and are reset by it.
  */
-std::string handle_audio_stats_request(std::span<const VirtualPort> ports,
+std::string handle_audio_stats_request(std::span<VirtualPort> ports,
                                        std::span<const ControllerRuntime> controllers) {
   const auto now = Clock::now();
-  const auto fixed = [](double value, int decimals) {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(decimals) << value;
-    return out.str();
-  };
   std::string reply = "{";
   reply += vds::jsonl_bool_field("OK", true);
   reply += ',';
   reply += vds::jsonl_string_field("error", "");
   reply += ",\"ports\":[";
   bool first = true;
-  for (const auto &port : ports) {
+  for (auto &port : ports) {
     const bool connected = std::any_of(
         controllers.begin(), controllers.end(), [&](const ControllerRuntime &c) {
           return c.virtual_connected && c.device == port.path;
@@ -2977,78 +1584,11 @@ std::string handle_audio_stats_request(std::span<const VirtualPort> ports,
     if (!connected) {
       continue;
     }
-    AudioStats &stats = port.audio_stats;
-    const double window_s =
-        stats.window_start == Clock::time_point{}
-            ? 0.0
-            : std::chrono::duration<double>(now - stats.window_start).count();
-    const bool streaming = stats.last_send != Clock::time_point{} &&
-                           now - stats.last_send < std::chrono::milliseconds(250);
     if (!first) {
       reply += ',';
     }
     first = false;
-    reply += '{';
-    reply += vds::jsonl_string_field("path", port.path);
-    reply += ',';
-    reply += vds::jsonl_bool_field("streaming", streaming);
-    reply += ",\"buffer_length\":" + std::to_string(stats.buffer_length);
-    reply += ",\"buffer_ms\":" +
-             fixed(1000.0 * stats.buffer_length / VDS_HAPTICS_SAMPLE_RATE, 1);
-    reply += std::string(",\"buffer_auto\":") + (stats.buffer_auto ? "true" : "false");
-    reply += ",\"trims_total\":" + std::to_string(stats.trims_total);
-    reply += std::string(",\"haptics_only\":") + (stats.haptics_only ? "true" : "false");
-    // haptics | haptics+speaker | haptics+mic | haptics+speaker+mic, or mic
-    // (capture with no output stream) / idle.
-    const bool mic_open = port.audio_in_stream_active;
-    std::string packet_mode =
-        streaming ? (stats.haptics_only ? "haptics" : "haptics+speaker")
-                  : (mic_open ? "mic" : "idle");
-    if (streaming && mic_open) {
-      packet_mode += "+mic";
-    }
-    reply += ',';
-    reply += vds::jsonl_string_field("packet_mode", packet_mode);
-    reply += ',';
-    reply += vds::jsonl_bool_field("mic_open", mic_open);
-    reply += ",\"mic_packets_per_second\":" +
-             fixed(window_s > 0.0 ? stats.window_mic_packets / window_s : 0.0, 1);
-    reply += ",\"mic_packets_total\":" + std::to_string(stats.mic_packets_total);
-    reply += ",\"mic_startup_ms\":" + std::to_string(stats.mic_startup_ms);
-    reply += ",\"mic_first_sound_ms\":" + std::to_string(stats.mic_first_sound_ms);
-    reply += ",\"mic_while_closed_total\":" +
-             std::to_string(stats.mic_while_closed_total);
-    reply += ",\"haptics_only_total\":" + std::to_string(stats.haptics_only_total);
-    reply += ",\"window_seconds\":" + fixed(window_s, 2);
-    reply += ",\"packets_per_second\":" +
-             fixed(window_s > 0.0 ? stats.window_packets / window_s : 0.0, 1);
-    reply += ",\"max_gap_ms\":" + fixed(stats.window_max_gap_us / 1000.0, 1);
-    reply += ",\"late\":" + std::to_string(stats.window_late);
-    reply += ",\"refills\":" + std::to_string(stats.window_refills);
-    reply += ",\"packets_total\":" + std::to_string(stats.packets_total);
-    reply += ",\"late_total\":" + std::to_string(stats.late_total);
-    reply += ",\"refills_total\":" + std::to_string(stats.refills_total);
-    reply += ",\"queue_depth\":" + std::to_string(port.pending_audio_chunks.size());
-    reply += ",\"queue_dropped_total\":" +
-             std::to_string(port.trace_state.queue_dropped_audio_haptics_count);
-    reply += ",\"blocked_total\":" +
-             std::to_string(port.trace_state.blocked_audio_haptics_count);
-    reply += ',';
-    reply += vds::jsonl_bool_field("headphones", port.headset_plugged);
-    reply += ',';
-    reply += vds::jsonl_bool_field("speaker_mono", !port.headset_plugged);
-    reply += ",\"speaker_boost_db\":" + fixed(speaker_boost_db(port), 1);
-    reply += ",\"speaker_volume_percent\":" +
-             std::to_string(speaker_volume_percent(port));
-    reply += ",\"haptics_gain_percent\":" +
-             std::to_string(port.haptics_gain_percent);
-    reply += '}';
-    stats.window_start = now;
-    stats.window_packets = 0;
-    stats.window_mic_packets = 0;
-    stats.window_late = 0;
-    stats.window_refills = 0;
-    stats.window_max_gap_us = 0;
+    reply += vds::bridge_audio_stats_json(port, now);
   }
   reply += "]}\n";
   return reply;
@@ -3085,28 +1625,7 @@ void publish_companion_audio_status(std::span<const VirtualPort> ports,
     if (port == ports.end()) {
       continue;
     }
-    const TraceState &trace = port->trace_state;
-    const auto u32 = [](std::uint64_t value) {
-      return static_cast<std::uint32_t>(value);
-    };
-    status.controller_ready = true;
-    status.duplex_active = port->audio_in_stream_active;
-    status.mic_streaming = port->audio_in_requested;
-    status.headset_plugged = port->headset_plugged;
-    status.headset_route = port->headset_plugged &&
-                           (port->audio_out_stream_active ||
-                            port->speaker_waveout_active);
-    status.mic_packets_received = u32(trace.bt_mic_packet_count);
-    status.mic_packets_dropped = u32(trace.bt_mic_drop_count);
-    status.mic_decode_fail = u32(trace.bt_mic_decode_fail_count);
-    status.mic_decode_success = u32(trace.audio_in_forward_count);
-    status.mic_write_short = u32(trace.audio_in_write_short_count);
-    status.mic_write_success =
-        u32(trace.audio_in_forward_count - trace.audio_in_write_short_count);
-    status.mic_last_decoded_samples = static_cast<std::uint16_t>(
-        trace.mic_last_decoded_bytes / (2 * sizeof(std::int16_t)));
-    status.mic_last_written_bytes = trace.mic_last_decoded_bytes;
-    status.mic_peak_permille = trace.mic_peak_permille;
+    status = vds::bridge_audio_status(*port);
     break;
   }
   companion.audio_status = status;
@@ -3325,7 +1844,7 @@ void switch_port_persona(VirtualPort &port, ControllerRuntime &controller,
     port.persona_state = {};
     port.pending_audio_chunks.clear();
     port.audio_primed = false;
-    port.extractor = vds::PcmAudioExtractor{kLinuxSpeakerInputFrames};
+    port.extractor = vds::PcmAudioExtractor{vds::kBridgeSpeakerInputFrames};
     ioctl_noarg(port.fd.get(), VDS_IOC_CONNECT, "VDS_IOC_CONNECT");
     logger.log(vds::LogScope::Companion, vds::LogLevel::Info,
                port.path + " host persona " + host_persona_name(persona));
@@ -3508,76 +2027,15 @@ void apply_companion_state(std::vector<VirtualPort> &ports,
   }
 
   const vds::CompanionSettings &settings = companion.settings;
-  const vds::CompanionActuation &actuation = companion.actuation;
-
-  g_host_persona = vds::host_persona_from_value(settings.host_persona_mode)
-                       .value_or(vds::HostPersona::DualSense);
-  g_mic_allowed = g_mic_forced || settings.duplex_enabled;
-  g_mic_muted = settings.mic_muted;
-  g_mic_volume_percent = settings.mic_volume_percent;
-  g_mute_led_enabled = settings.mute_led_enabled;
+  const vds::DsCompanionOverrides overrides =
+      vds::bridge_companion_overrides(companion);
+  const vds::HostPersona host_persona = vds::bridge_settings().host_persona;
   for (auto &port : ports) {
     ControllerRuntime *controller =
         controller_for_port(controllers, port.path);
     if (controller != nullptr && controller->virtual_connected &&
-        port.persona != g_host_persona) {
-      switch_port_persona(port, *controller, g_host_persona, logger);
-    }
-  }
-
-  vds::DsCompanionOverrides overrides;
-  overrides.lightbar_override = settings.lightbar_override_enabled;
-  overrides.lightbar_color = {settings.lightbar_red, settings.lightbar_green,
-                              settings.lightbar_blue};
-  overrides.lightbar_brightness_percent = settings.lightbar_brightness_percent;
-  overrides.player_led_enabled = settings.player_led_enabled;
-  overrides.classic_rumble_gain_percent = settings.classic_rumble_gain_percent;
-  overrides.classic_rumble_v1 = settings.classic_rumble_v1;
-  overrides.trigger_intensity_percent =
-      settings.trigger_effect_intensity_percent;
-  overrides.speaker_volume_percent = settings.speaker_volume_percent;
-  overrides.speaker_gain_level = settings.speaker_gain_level;
-  overrides.mic_processing = settings.mic_processing;
-  overrides.mic_speaker_gain_level = settings.mic_speaker_gain_level;
-  overrides.test_rumble_active = actuation.test_rumble_active;
-  overrides.test_rumble_power = actuation.test_rumble_power;
-
-  if (actuation.test_trigger.active) {
-    const vds::CompanionTriggerEffect &effect = actuation.test_trigger;
-    // Target: 0 both, 1 left, 2 right (DS5 Bridge firmware convention).
-    if (effect.target != 2) {
-      overrides.left_trigger_active = true;
-      vds::encode_companion_trigger_effect_v2(
-          std::span<std::uint8_t, vds::kTriggerEffectSize>(
-              overrides.left_trigger),
-          effect);
-    }
-    if (effect.target != 1) {
-      overrides.right_trigger_active = true;
-      vds::encode_companion_trigger_effect_v2(
-          std::span<std::uint8_t, vds::kTriggerEffectSize>(
-              overrides.right_trigger),
-          effect);
-    }
-  } else {
-    // Persistent effects are stored per trigger; render each independently.
-    const vds::CompanionTriggerEffect &left =
-        actuation.persistent_trigger_left;
-    if (left.active) {
-      overrides.left_trigger_active = true;
-      vds::encode_companion_trigger_effect_v2(
-          std::span<std::uint8_t, vds::kTriggerEffectSize>(
-              overrides.left_trigger),
-          left);
-    }
-    const vds::CompanionTriggerEffect &right =
-        actuation.persistent_trigger_right;
-    if (right.active) {
-      overrides.right_trigger_active = true;
-      vds::encode_companion_trigger_effect_v2(
-          std::span<std::uint8_t, vds::kTriggerEffectSize>(
-              overrides.right_trigger),
-          right);
+        port.persona != host_persona) {
+      switch_port_persona(port, *controller, host_persona, logger);
     }
   }
 
@@ -3605,21 +2063,9 @@ void apply_companion_state(std::vector<VirtualPort> &ports,
         !controller->virtual_connected) {
       continue;
     }
-    port.haptics_gain_percent = settings.haptics_gain_percent;
-    port.audio_stats.buffer_auto = settings.haptics_buffer_auto;
-    port.audio_stats.buffer_length = settings.haptics_buffer_auto
-                                         ? port.buffer_tuner.buffer_length()
-                                         : settings.haptics_buffer_length;
-    port.haptics_builder.set_buffer_length(port.audio_stats.buffer_length);
-    port.output_state.set_companion_overrides(overrides);
-    sync_port_mic(port, &*controller->backend, logger);
-    try {
-      forward_bt_state_if_changed(port, *controller->backend, trace_flags,
-                                  logger, "companion update");
-    } catch (const std::exception &error) {
-      logger.log(vds::LogScope::Companion, vds::LogLevel::Warn,
-                 port.path + " companion state send failed: " + error.what());
-    }
+    LinuxBridgeBluetooth bt(*controller->backend);
+    vds::bridge_apply_companion(port, settings, overrides, bt, trace_flags,
+                                logger);
   }
 }
 
@@ -3715,15 +2161,17 @@ int main(int argc, char **argv) {
     logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
                "started socket=" + options.socket + " log=" + options.log_path +
                    " db=" + options.db_path);
-    g_speaker_boost_db = options.speaker_boost_db;
-    g_mic_forced = options.mic_enabled;
-    g_mic_allowed = g_mic_forced;
-    if (g_mic_forced) {
+    vds::BridgeSettings &bridge = vds::bridge_settings();
+    bridge.speaker_boost_db = options.speaker_boost_db;
+    bridge.mic_forced = options.mic_enabled;
+    bridge.mic_allowed = bridge.mic_forced;
+    if (bridge.mic_forced) {
       logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
                  "controller microphone enabled (--mic)");
     }
     logger.log(vds::LogScope::Output, vds::LogLevel::Info,
-               "speaker boost " + std::to_string(g_speaker_boost_db) + " dB");
+               "speaker boost " + std::to_string(bridge.speaker_boost_db) +
+                   " dB");
     if (vds::discover_vds_devices().empty()) {
       logger.log(vds::LogScope::Port, vds::LogLevel::Error,
                  std::string(kVirtualPortProviderUnavailableReason) +
@@ -3813,10 +2261,6 @@ int main(int argc, char **argv) {
       }
       std::array<epoll_event, 64> events{};
       int timeout_ms = next_wakeup_timeout_ms(ports, controllers);
-      if (mic_open_retry_pending(ports)) {
-        const int retry_ms = static_cast<int>(kMicOpenRetry.count());
-        timeout_ms = timeout_ms < 0 ? retry_ms : std::min(timeout_ms, retry_ms);
-      }
       if (host_watch_fd) {
         timeout_ms = timeout_ms < 0 ? 2000 : std::min(timeout_ms, 2000);
       }

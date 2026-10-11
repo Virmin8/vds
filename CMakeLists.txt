@@ -89,7 +89,8 @@ add_library(vdsctl_common OBJECT src/vdsctl_common.cc)
 target_include_directories(vdsctl_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(vdsctl_common PUBLIC jsonl vds_config)
 
-add_library(vdsd_common OBJECT src/vdsd_common.cc src/vds_companion.cc)
+add_library(vdsd_common OBJECT src/vdsd_common.cc src/vds_companion.cc
+                               src/vds_bridge.cc)
 target_include_directories(
   vdsd_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                      ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -222,11 +223,16 @@ target_link_libraries(rumble_mode_test PRIVATE vds_protocol)
 add_executable(audio_pacing_test tests/audio_pacing_test.cc)
 target_link_libraries(audio_pacing_test PRIVATE vds_protocol)
 
+add_executable(bridge_test tests/bridge_test.cc)
+target_link_libraries(bridge_test PRIVATE vdsd_common vds_protocol jsonl
+                                          vds_common vds_config vds_log)
+
 enable_testing()
 foreach(vds_test trigger_effect_v2_test speaker_gain_test bt_input_report_test
                  persona_test speaker_resampler_test
                  speaker_enhancer_test haptics_resampler_test
-                 speaker_mono_test rumble_mode_test audio_pacing_test)
+                 speaker_mono_test rumble_mode_test audio_pacing_test
+                 bridge_test)
   # The tests use assert(); keep them active in Release builds too.
   target_compile_options(${vds_test} PRIVATE -UNDEBUG)
   add_test(NAME ${vds_test} COMMAND ${vds_test})
