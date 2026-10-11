@@ -1177,8 +1177,14 @@ void DsOutputState::recompute_effective_state() {
   if (audio_out_stream_active_ && !audio_out_headset_) {
     effective_state_[kOutputFlag0Offset] |=
         kOutputFlag0AudioControlEnable | kOutputFlag0SpeakerVolumeEnable;
-    effective_state_[kOutputAudioControlOffset] = audio_control_with_output_path(
-        effective_state_[kOutputAudioControlOffset], kOutputPathSpeaker);
+    // Mic select/processing bits only while the mic records: the speaker
+    // sounded different with them set (pre-mic builds sent the path alone).
+    effective_state_[kOutputAudioControlOffset] =
+        mic_stream_active_
+            ? audio_control_with_output_path(
+                  effective_state_[kOutputAudioControlOffset],
+                  kOutputPathSpeaker)
+            : kOutputPathSpeaker;
     effective_state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
     effective_state_[kOutputAudioControl2Offset] =
         static_cast<std::uint8_t>(
@@ -1417,6 +1423,7 @@ BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
   state_[kOutputAudioControl2Offset] = audio_control2_;
   state_[kOutputMuteLedOffset] = muted ? 1 : 0;
   state_[kOutputPowerSaveControlOffset] = power_save_control;
+  mic_stream_active_ = active;
   recompute_effective_state();
 
   BtStateReport report{};
@@ -1434,7 +1441,9 @@ BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
   report[kBtStateOffset + kOutputAudioControlOffset] = audio_control;
   report[kBtStateOffset + kOutputMuteLedOffset] = muted ? 1 : 0;
   report[kBtStateOffset + kOutputPowerSaveControlOffset] = power_save_control;
-  report[kBtStateOffset + kOutputAudioControl2Offset] = audio_control2_;
+  // Effective value, so the companion speaker gain survives mic open/close.
+  report[kBtStateOffset + kOutputAudioControl2Offset] =
+      effective_state_[kOutputAudioControl2Offset];
   fill_output_report_checksum(report);
   return report;
 }
@@ -1588,9 +1597,13 @@ void HapticsPacketBuilder::write_audio_blocks(
       kOutputFlag0AudioControlEnable | kOutputFlag0SpeakerVolumeEnable;
   audio_state[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
   audio_state[kOutputHeadphoneVolumeOffset] = kOutputHeadphoneVolumeMax;
-  audio_state[kOutputAudioControlOffset] = audio_control_with_output_path(
-      audio_state[kOutputAudioControlOffset],
-      headset_plugged ? kOutputPathHeadphones : kOutputPathSpeaker);
+  const std::uint8_t output_path =
+      headset_plugged ? kOutputPathHeadphones : kOutputPathSpeaker;
+  audio_state[kOutputAudioControlOffset] =
+      audio_sections_enabled
+          ? audio_control_with_output_path(
+                audio_state[kOutputAudioControlOffset], output_path)
+          : output_path;
   std::copy(audio_state.begin(), audio_state.end(), packet.begin() + 13);
   packet[76] = 0x12 | (1 << 7);
   packet[77] = kHapticsSampleSize;

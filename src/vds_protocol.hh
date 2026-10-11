@@ -397,6 +397,7 @@ private:
   bool emulate_light_brightness_ = false;
   bool audio_out_stream_active_ = false;
   bool audio_out_headset_ = false;
+  bool mic_stream_active_ = false;
   bool headset_mic_plugged_ = false;
   std::uint8_t report_sequence_ = 0;
   std::uint8_t mic_sequence_ = 0;
