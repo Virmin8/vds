@@ -1403,10 +1403,12 @@ bool handle_bt_input(VirtualPort &port, vds::BtL2capBackend &bt_backend,
   bool headset_mic_changed = false;
   bool mic_mute_changed = false;
   bool output_state_changed = false;
-  // Mute toggles mic mute ("Normal" Mute button mode) while the mic is on; the
-  // app sees the change through the status report.
+  // Mute toggles mic mute while the mic is on, unless the Mute button mode is
+  // Chord (Mute starts chords); vdsd has no keyboard/quiet modes, so those act
+  // as Normal. The app sees the change through the status report.
+  constexpr std::uint8_t kMuteButtonModeChord = 3;
   if (mute_button_down && !port.mute_button_down && g_mic_allowed &&
-      companion.settings.mute_button_mode == 0) {
+      companion.settings.mute_button_mode != kMuteButtonModeChord) {
     companion.settings.mic_muted = !companion.settings.mic_muted;
     ++companion.settings_revision;
     g_mic_muted = companion.settings.mic_muted;
