@@ -1440,6 +1440,9 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
   std::atomic_uint32_t trace_flags = 0;
   bool reload_requested = false;
   bool scan_requested = true;
+  // Fixed deadline for the periodic rescan, so frequent control requests (the
+  // app polls every 500 ms) can't keep pushing it back.
+  Clock::time_point next_scan_at = Clock::now();
   bool config_load_logged = false;
   bool virtual_port_provider_warned = false;
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
@@ -1503,8 +1506,13 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
       scan_requested = true;
     }
 
+    if (Clock::now() >= next_scan_at) {
+      scan_requested = true;
+    }
+
     if (scan_requested) {
       scan_requested = false;
+      next_scan_at = Clock::now() + kBridgeOpenRetryDelay;
       try {
         const vds::ConfigDb db = load_config_db_for_attempt(options, logger);
         if (!config_load_logged || reload_requested) {
@@ -1689,7 +1697,7 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
     }
 
     const auto now = Clock::now();
-    std::optional<Clock::time_point> retry_after = now + kBridgeOpenRetryDelay;
+    std::optional<Clock::time_point> retry_after = next_scan_at;
     if (!worker_failure_backoffs.empty()) {
       const auto next_retry = std::min_element(
           worker_failure_backoffs.begin(), worker_failure_backoffs.end(),
