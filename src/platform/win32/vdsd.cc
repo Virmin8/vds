@@ -1866,6 +1866,8 @@ int run_windows_daemon(int argc, char **argv, bool service_mode) {
     {
       vds::BridgeSettings &bridge = vds::bridge_settings();
       bridge.speaker_boost_db = options.speaker_boost_db;
+      g_companion.settings.speaker_boost_db =
+          static_cast<std::uint8_t>(std::lround(options.speaker_boost_db));
       bridge.mic_forced = options.mic_enabled;
       bridge.mic_allowed = bridge.mic_forced;
     }

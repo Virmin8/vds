@@ -112,5 +112,37 @@ int main() {
     std::printf("50 Hz: %+.1f dB\n", level);
     assert(level < -25.0);
   }
+
+  // Limiter stats: a full-scale tone at +18 dB is cut ~19 dB (to -1 dBFS),
+  // a quiet one not at all, and silence is not counted.
+  {
+    vds::SpeakerEnhancer enhancer;
+    enhancer.set_boost_db(18.0f);
+    auto loud = tone(1000.0, 32767.0);
+    run(enhancer, loud);
+    const vds::SpeakerLimiterStats stats = enhancer.take_limiter_stats();
+    std::printf("full-scale +18 dB limiting: avg %.1f dB, max %.1f dB\n",
+                stats.average_db(), stats.max_reduction_db);
+    assert(stats.frames > kFrames / 2);
+    assert(stats.average_db() > 17.0f && stats.max_reduction_db < 20.0f);
+    assert(enhancer.take_limiter_stats().frames == 0);
+
+    auto quiet = tone(1000.0, 1000.0);
+    run(enhancer, quiet); // let the limiter release first
+    enhancer.take_limiter_stats();
+    quiet = tone(1000.0, 1000.0);
+    run(enhancer, quiet);
+    const vds::SpeakerLimiterStats quiet_stats = enhancer.take_limiter_stats();
+    std::printf("quiet +18 dB limiting: avg %.2f dB\n", quiet_stats.average_db());
+    assert(quiet_stats.frames > 0 && quiet_stats.average_db() < 0.1f);
+
+    // Silence: only the high-pass filter's short tail after the tone counts.
+    std::vector<std::int16_t> silence(kFrames * 2, 0);
+    run(enhancer, silence);
+    assert(enhancer.take_limiter_stats().frames < kFrames / 100);
+    silence.assign(kFrames * 2, 0); // process() wrote the tail into it
+    run(enhancer, silence);
+    assert(enhancer.take_limiter_stats().frames == 0);
+  }
   return 0;
 }

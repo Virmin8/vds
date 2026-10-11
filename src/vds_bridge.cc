@@ -1371,6 +1371,7 @@ DsCompanionOverrides bridge_companion_overrides(CompanionRuntime &companion) {
   bridge.mic_muted = settings.mic_muted;
   bridge.mic_volume_percent = settings.mic_volume_percent;
   bridge.mute_led_enabled = settings.mute_led_enabled;
+  bridge.speaker_boost_db = settings.speaker_boost_db;
 
   DsCompanionOverrides overrides;
   overrides.lightbar_override = settings.lightbar_override_enabled;
@@ -1510,6 +1511,10 @@ std::string bridge_audio_stats_json(BridgePort &port, Clock::time_point now) {
   reply += ',';
   reply += jsonl_bool_field("speaker_mono", !port.headset_plugged);
   reply += ",\"speaker_boost_db\":" + fixed(bridge_speaker_boost_db(port), 1);
+  SpeakerLimiterStats limiter = port.extractor.take_speaker_limiter_stats();
+  limiter.merge(port.waveout_extractor.take_speaker_limiter_stats());
+  reply += ",\"speaker_limiting_db\":" + fixed(limiter.average_db(), 1);
+  reply += ",\"speaker_limiting_max_db\":" + fixed(limiter.max_reduction_db, 1);
   reply += ",\"speaker_volume_percent\":" +
            std::to_string(bridge_speaker_volume_percent(port));
   reply += ",\"haptics_gain_percent\":" +

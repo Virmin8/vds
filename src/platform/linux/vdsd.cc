@@ -2255,6 +2255,8 @@ int main(int argc, char **argv) {
     bool reload_requested = true;
     bool epoll_dirty = true;
     vds::CompanionRuntime companion;
+    companion.settings.speaker_boost_db =
+        static_cast<std::uint8_t>(std::lround(options.speaker_boost_db));
     std::uint64_t applied_companion_version = 0;
     std::vector<ControlClient> control_clients;
     RssiPoller rssi_poller;

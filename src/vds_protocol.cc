@@ -16,6 +16,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include <opus/opus.h>
 
@@ -406,6 +407,10 @@ void SpeakerEnhancer::set_boost_db(float boost_db) {
   }
 }
 
+SpeakerLimiterStats SpeakerEnhancer::take_limiter_stats() {
+  return std::exchange(limiter_stats_, SpeakerLimiterStats{});
+}
+
 void SpeakerEnhancer::set_volume_percent(std::uint16_t percent) {
   const float level = static_cast<float>(std::min<std::uint16_t>(percent, 100)) /
                       100.0f;
@@ -504,6 +509,16 @@ void SpeakerEnhancer::process(std::span<std::int16_t> samples,
     limiter_gain_ = average < limiter_gain_
                         ? average
                         : limiter_gain_ + (average - limiter_gain_) * release;
+    // Count frames with sound (above ~-60 dBFS before the boost) only, so
+    // silence does not water the average down.
+    if (peak > 32.0f * gain_) {
+      const float reduction_db =
+          limiter_gain_ < 1.0f ? -20.0f * std::log10(limiter_gain_) : 0.0f;
+      limiter_stats_.reduction_db_sum += reduction_db;
+      ++limiter_stats_.frames;
+      limiter_stats_.max_reduction_db =
+          std::max(limiter_stats_.max_reduction_db, reduction_db);
+    }
     volume_ += (volume_target_ - volume_) * ramp;
     const float output_gain = limiter_gain_ * volume_;
 
@@ -650,6 +665,10 @@ PcmAudioExtractor::~PcmAudioExtractor() = default;
 
 void PcmAudioExtractor::set_speaker_boost_db(float boost_db) {
   speaker_encoder_->enhancer.set_boost_db(boost_db);
+}
+
+SpeakerLimiterStats PcmAudioExtractor::take_speaker_limiter_stats() {
+  return speaker_encoder_->enhancer.take_limiter_stats();
 }
 
 void PcmAudioExtractor::set_speaker_volume_percent(std::uint16_t percent) {

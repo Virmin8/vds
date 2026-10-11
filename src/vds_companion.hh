@@ -38,6 +38,9 @@ struct CompanionSettings {
   std::uint16_t idle_disconnect_timeout_minutes = 15; // 1-120, like the firmware
   std::uint16_t speaker_volume_percent = 100;
   std::uint8_t speaker_gain_level = 1;
+  // Linux-port extension (command 0x46): built-in speaker boost in dB, 1-18
+  // from the app (the --speaker-boost-db default may be 0).
+  std::uint8_t speaker_boost_db = 6;
   std::uint8_t lightbar_red = 0;
   std::uint8_t lightbar_green = 0;
   std::uint8_t lightbar_blue = 255;

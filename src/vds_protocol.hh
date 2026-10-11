@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -118,11 +119,31 @@ private:
  * boost and a look-ahead peak limiter raise the level without clipping.
  * Adds kSpeakerLimiterLookahead - 1 frames of latency (~1 ms) while active.
  */
-// Default to the full boost: the limiter keeps it clip-free, the preamp gain
-// can stay at its lowest level, and volume is turned down on the host.
-constexpr float kDefaultSpeakerBoostDb = 18.0f;
+// Default to a moderate boost. With the host volume at 100% (the usual case),
+// loud music boosted past ~6 dB leaves the limiter cutting most of the time:
+// at +18 dB it averages ~12 dB of gain reduction for no extra loudness over
+// +12 dB, and transients and highs dull audibly. +6 dB is about 1 dB quieter
+// than +18 dB with almost no limiting.
+constexpr float kDefaultSpeakerBoostDb = 6.0f;
 constexpr float kMaxSpeakerBoostDb = 18.0f;
 constexpr std::size_t kSpeakerLimiterLookahead = 48;
+
+// How hard the limiter worked while sound played: the boost is set too high
+// for the input level when it is cutting several dB most of the time.
+struct SpeakerLimiterStats {
+  double reduction_db_sum = 0.0; // over frames with sound
+  std::uint64_t frames = 0;
+  float max_reduction_db = 0.0f;
+
+  float average_db() const {
+    return frames > 0 ? static_cast<float>(reduction_db_sum / frames) : 0.0f;
+  }
+  void merge(const SpeakerLimiterStats &other) {
+    reduction_db_sum += other.reduction_db_sum;
+    frames += other.frames;
+    max_reduction_db = std::max(max_reduction_db, other.max_reduction_db);
+  }
+};
 
 class SpeakerEnhancer {
 public:
@@ -137,6 +158,9 @@ public:
 
   // In place, `frames` interleaved stereo frames.
   void process(std::span<std::int16_t> samples, std::size_t frames);
+
+  // Returns the limiter activity since the last call and starts a new window.
+  SpeakerLimiterStats take_limiter_stats();
 
 private:
   struct Biquad {
@@ -157,6 +181,7 @@ private:
   std::size_t delay_pos_ = 0;
   float volume_target_ = 1.0f;
   float volume_ = 1.0f; // ramps towards volume_target_
+  SpeakerLimiterStats limiter_stats_;
 };
 using UsbInputReport = std::array<std::uint8_t, kUsbInputReportSize>;
 
@@ -447,6 +472,7 @@ public:
 
   // Speaker loudness boost in dB; 0 bypasses (e.g. while headphones are in).
   void set_speaker_boost_db(float boost_db);
+  SpeakerLimiterStats take_speaker_limiter_stats();
   // Companion speaker volume 0-100 (100 while headphones are in).
   void set_speaker_volume_percent(std::uint16_t percent);
   // Haptics gain in percent (companion setting, up to 1000).

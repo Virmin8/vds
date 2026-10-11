@@ -153,6 +153,7 @@ CompanionReport build_status_report(
   report[47] = 0; // Adaptive trigger output recent.
   report[48] = settings.host_persona_mode;
   report[49] = runtime.supported_host_persona_mask;
+  report[50] = settings.speaker_boost_db;
   report[51] = settings.mic_muted ? 1 : 0;
   report[57] = settings.speaker_gain_level;
   report[59] = settings.lightbar_override_enabled ? 1 : 0;
@@ -299,6 +300,12 @@ std::uint8_t apply_command(CompanionRuntime &runtime,
       return kAckErrInvalidValue;
     }
     settings.mic_speaker_gain_level = static_cast<std::uint8_t>(value);
+    return kAckOk;
+  case 0x46: // SET_SPEAKER_BOOST (Linux-port extension; dB)
+    if (value < 1 || value > 18) {
+      return kAckErrInvalidValue;
+    }
+    settings.speaker_boost_db = static_cast<std::uint8_t>(value);
     return kAckOk;
   case 0x42: // SET_PROFILE_SHORTCUT_ENABLED (Linux-port extension)
     if (value > 1) {
