@@ -5,7 +5,9 @@ Wants=bluetooth.service
 
 [Service]
 Type=simple
-ExecStartPre=modprobe vds_hcd
+# vhci_hcd (in-tree USB/IP host driver) carries the virtual controllers; the
+# out-of-tree vds_hcd module is only used when it is already loaded.
+ExecStartPre=-modprobe vhci-hcd
 ExecStart=@VDS_SYSTEMD_VDSD@
 Restart=on-failure
 RestartSec=1s

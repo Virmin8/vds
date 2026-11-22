@@ -9,8 +9,10 @@ namespace vds {
 
 namespace fs = std::filesystem;
 
-std::optional<std::string> find_port_hidraw(std::size_t port_index) {
-  const std::string marker = "/vds_hcd." + std::to_string(port_index) + "/";
+std::optional<std::string> find_port_hidraw(const std::string &marker) {
+  if (marker.empty()) {
+    return std::nullopt;
+  }
   std::error_code error;
   for (const auto &entry : fs::directory_iterator("/sys/class/hidraw", error)) {
     const fs::path device = fs::canonical(entry.path() / "device", error);

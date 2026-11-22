@@ -167,6 +167,20 @@ else()
   target_include_directories(vds_bluez PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(vds_bluez PUBLIC vds_config PkgConfig::DBUS)
 
+  # Platform-neutral USB/IP device model + the vhci_hcd (in-tree USB/IP host
+  # driver) port backend that plugs the virtual controllers in.
+  add_library(vds_usbip_device OBJECT src/usbip/vds_usbip_device.cc)
+  target_include_directories(
+    vds_usbip_device PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  add_library(vds_usbip_vhci OBJECT src/platform/linux/vds_usbip_vhci.cc)
+  target_include_directories(
+    vds_usbip_vhci PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                          ${CMAKE_CURRENT_SOURCE_DIR}/src
+                          ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/linux)
+  target_link_libraries(vds_usbip_vhci PUBLIC vds_usbip_device)
+
   add_library(vds_udev OBJECT src/platform/linux/vds_udev.cc)
   target_include_directories(vds_udev PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(vds_udev PUBLIC vds_config vds_common vds_io
@@ -189,6 +203,8 @@ else()
             vds_io
             vds_log
             vds_udev
+            vds_usbip_device
+            vds_usbip_vhci
             vdsd_common)
 
   add_executable(vdsctl src/platform/linux/vdsctl.cc)
@@ -412,6 +428,11 @@ if(NOT WIN32)
                                                  vds_common vds_config vds_log)
   target_compile_options(companion_persona_test PRIVATE -UNDEBUG)
   add_test(NAME companion_persona_test COMMAND companion_persona_test)
+
+  add_executable(usbip_device_test tests/usbip_device_test.cc)
+  target_link_libraries(usbip_device_test PRIVATE vds_usbip_device vds_log)
+  target_compile_options(usbip_device_test PRIVATE -UNDEBUG)
+  add_test(NAME usbip_device_test COMMAND usbip_device_test)
 
   add_executable(host_session_test tests/host_session_test.cc
                                    src/platform/linux/vds_host_watch.cc)

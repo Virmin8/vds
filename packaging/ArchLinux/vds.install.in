@@ -1,6 +1,5 @@
 # shellcheck shell=bash
-_dkms_name="vds_hcd"
-_dkms_version="@DKMS_VERSION@"
+_legacy_module="vds_hcd"
 _install_service="/usr/share/vds/install-service.sh"
 _uninstall_service="/usr/share/vds/uninstall-service.sh"
 
@@ -12,42 +11,35 @@ _is_udev_running() {
 	command -v udevadm >/dev/null 2>&1 && [ -S /run/udev/control ]
 }
 
-_unload_vds_hcd_module() {
-	if [ -d "/sys/module/$_dkms_name" ]; then
-		modprobe -r "$_dkms_name"
-	fi
-}
-
-_dkms_remove_all_versions() {
-	local ignore_errors=${1:-}
+# Earlier vds releases shipped an out-of-tree vds_hcd kernel module via DKMS.
+# vdsd now uses the in-tree vhci_hcd driver, so remove any leftover copy.
+_remove_legacy_vds_hcd() {
 	local line
 	local module
 	local module_version
 	local version
 
+	if [ -d "/sys/module/$_legacy_module" ]; then
+		modprobe -r "$_legacy_module" || true
+	fi
+	command -v dkms >/dev/null 2>&1 || return 0
 	while IFS= read -r line; do
 		module_version=${line%%,*}
 		module_version=${module_version%%:*}
 		module=${module_version%%/*}
 		version=${module_version#*/}
 		case "$module" in
-		"$_dkms_name" | "$_dkms_name"-*)
+		"$_legacy_module" | "$_legacy_module"-*)
 			if [ -n "$version" ] && [ "$version" != "$module_version" ]; then
-				if ! dkms remove -m "$module" -v "$version" --all; then
-					[ "$ignore_errors" = "--ignore-errors" ] || return 1
-				fi
+				dkms remove -m "$module" -v "$version" --all || true
 			fi
 			;;
 		esac
 	done < <(dkms status 2>/dev/null || true)
 }
 
-_dkms_install_current() {
-	_unload_vds_hcd_module || return 1
-	_dkms_remove_all_versions
-	dkms add -m "$_dkms_name" -v "$_dkms_version"
-	dkms build -m "$_dkms_name" -v "$_dkms_version"
-	dkms install -m "$_dkms_name" -v "$_dkms_version"
+_load_vhci() {
+	modprobe vhci-hcd || true
 }
 
 _reload_udev_rules() {
@@ -168,7 +160,8 @@ NOTICE
 }
 
 post_install() {
-	_dkms_install_current
+	_remove_legacy_vds_hcd
+	_load_vhci
 	_reload_udev_rules
 	_install_vdsd_service
 	_print_bluetooth_pairing_notice
@@ -177,12 +170,11 @@ post_install() {
 
 pre_upgrade() {
 	_stop_vdsd_service
-	_unload_vds_hcd_module || return 1
-	_dkms_remove_all_versions --ignore-errors
 }
 
 post_upgrade() {
-	_dkms_install_current
+	_remove_legacy_vds_hcd
+	_load_vhci
 	_reload_udev_rules
 	_install_vdsd_service
 	_print_bluetooth_pairing_notice
@@ -193,8 +185,6 @@ pre_remove() {
 	if [ -x "$_uninstall_service" ]; then
 		"$_uninstall_service" --stop --disable || true
 	fi
-	_unload_vds_hcd_module || return 1
-	_dkms_remove_all_versions --ignore-errors
 }
 
 post_remove() {

@@ -1,21 +1,21 @@
 #!/bin/sh
 set -e
 
-DKMS_NAME="vds_hcd"
-DKMS_VERSION="@DKMS_VERSION@"
 INSTALL_SERVICE="/usr/share/vds/install-service.sh"
 
 is_udev_running() {
 	command -v udevadm >/dev/null 2>&1 && [ -S /run/udev/control ]
 }
 
-unload_vds_hcd_module() {
-	if [ -d "/sys/module/$DKMS_NAME" ]; then
-		modprobe -r "$DKMS_NAME"
-	fi
-}
+LEGACY_MODULE="vds_hcd"
 
-remove_all_dkms_versions() {
+# Earlier vds releases shipped an out-of-tree vds_hcd kernel module via DKMS.
+# vdsd now uses the in-tree vhci_hcd driver, so remove any leftover copy.
+remove_legacy_vds_hcd() {
+	if [ -d "/sys/module/$LEGACY_MODULE" ]; then
+		modprobe -r "$LEGACY_MODULE" || true
+	fi
+	command -v dkms >/dev/null 2>&1 || return 0
 	dkms status 2>/dev/null |
 	while IFS= read -r line; do
 		module_version=${line%%,*}
@@ -23,13 +23,14 @@ remove_all_dkms_versions() {
 		module=${module_version%%/*}
 		version=${module_version#*/}
 		case "$module" in
-		"$DKMS_NAME" | "$DKMS_NAME"-*)
+		"$LEGACY_MODULE" | "$LEGACY_MODULE"-*)
 			if [ -n "$version" ] && [ "$version" != "$module_version" ]; then
-				dkms remove -m "$module" -v "$version" --all
+				dkms remove -m "$module" -v "$version" --all || true
 			fi
 			;;
 		esac
 	done
+	rm -rf /usr/src/"$LEGACY_MODULE"-* 2>/dev/null || true
 }
 
 print_bluetooth_pairing_notice() {
@@ -126,11 +127,8 @@ NOTICE
 
 case "$1" in
 configure)
-	unload_vds_hcd_module
-	remove_all_dkms_versions
-	dkms add -m "$DKMS_NAME" -v "$DKMS_VERSION"
-	dkms build -m "$DKMS_NAME" -v "$DKMS_VERSION"
-	dkms install -m "$DKMS_NAME" -v "$DKMS_VERSION"
+	remove_legacy_vds_hcd
+	modprobe vhci-hcd || true
 
 	if is_udev_running; then
 		udevadm control --reload-rules || true

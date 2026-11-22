@@ -44,7 +44,6 @@ jobs:
           sudo apt-get install -y \
             git \
             build-essential \
-            dkms \
             cmake \
             pkg-config
           sudo apt-get install -y \
@@ -88,7 +87,6 @@ jobs:
               pacman -S --noconfirm \
                 git \
                 base-devel \
-                dkms \
                 cmake \
                 pkgconf
               pacman -S --noconfirm \

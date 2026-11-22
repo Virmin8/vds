@@ -75,16 +75,11 @@ require_tool() {
 	fi
 }
 
-sanitize_dkms_version() {
-	printf '%s' "$1" | tr '~:' '__'
-}
-
 substitute_template() {
 	local input=$1
 	local output=$2
 	sed \
 		-e "s|@VERSION@|${version}|g" \
-		-e "s|@DKMS_VERSION@|${dkms_version}|g" \
 		-e "s|@ARCH@|${arch}|g" \
 		-e "s|@INSTALLED_SIZE@|${installed_size}|g" \
 		"$input" >"$output"
@@ -102,12 +97,10 @@ version_args=(--internal debian)
 package_args=(--package debian --name "$package_name" --pkgrel "$debian_revision" --arch "$arch")
 upstream_version=$("${repo_root}/generate-version.sh" "${version_args[@]}")
 version="${upstream_version}-${debian_revision}"
-dkms_version=$(sanitize_dkms_version "$upstream_version")
 build_dir="${build_root}/cmake"
 stage_dir="${build_root}/stage"
 package_root="${build_root}/${package_name}_${version}_${arch}"
 debian_dir="${package_root}/DEBIAN"
-dkms_source_dir="${package_root}/usr/src/vds_hcd-${dkms_version}"
 output_dir=$(realpath -m "$output_dir")
 deb_path="${output_dir}/$("${repo_root}/generate-version.sh" "${package_args[@]}")"
 
@@ -136,28 +129,8 @@ install -Dm0755 "${repo_root}/uninstall-service.sh" \
 install -Dm0644 "${repo_root}/logrotate-vds.conf" \
 	"${package_root}/etc/logrotate.d/vds"
 
-install -d "$dkms_source_dir/include"
-install -m0644 "${repo_root}/module/Makefile" \
-	"${repo_root}/module/Kbuild" \
-	"$dkms_source_dir/"
-for source in "${repo_root}/module/"*.c; do
-	case "$(basename "$source")" in
-	*.mod.c)
-		continue
-		;;
-	esac
-	install -m0644 "$source" "$dkms_source_dir/"
-done
-for source in "${repo_root}/module/"*.h; do
-	install -m0644 "$source" "$dkms_source_dir/"
-done
-sed "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${dkms_version}\"/" \
-	"${repo_root}/module/dkms.conf" >"${dkms_source_dir}/dkms.conf"
-install -d "${dkms_source_dir}/include/uapi" "${dkms_source_dir}/include/vds"
-install -m0644 "${repo_root}/include/uapi/"*.h \
-	"${dkms_source_dir}/include/uapi/"
-install -m0644 "${repo_root}/include/vds/"*.h \
-	"${dkms_source_dir}/include/vds/"
+install -Dm0644 "${repo_root}/packaging/vds-modules-load.conf" \
+	"${package_root}/usr/lib/modules-load.d/vds.conf"
 
 install -Dm0644 "${repo_root}/README.md" \
 	"${package_root}/usr/share/doc/vds/README.md"

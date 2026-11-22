@@ -18,9 +18,9 @@ namespace vds {
  * game closes it.
  */
 
-// /dev/hidrawN of the virtual DualSense on port `port_index` (/dev/vdsN ->
-// platform device vds_hcd.N), if the kernel has bound one.
-std::optional<std::string> find_port_hidraw(std::size_t port_index);
+// /dev/hidrawN whose sysfs device path contains `marker` (the vhci_hcd USB
+// device path of a virtual port).
+std::optional<std::string> find_port_hidraw(const std::string &marker);
 
 // Processes (other than `exclude`) holding `node` open, from /proc/*/fd.
 std::set<pid_t> node_openers(const std::string &node, pid_t exclude);

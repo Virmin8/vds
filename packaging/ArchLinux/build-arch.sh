@@ -82,41 +82,12 @@ substitute_template() {
 	sed \
 		-e "s|@PKGVER@|${pkgver}|g" \
 		-e "s|@PKGREL@|${pkgrel}|g" \
-		-e "s|@DKMS_VERSION@|${dkms_version}|g" \
 		-e "s|@ARCH@|${arch}|g" \
 		-e "s|@SIZE@|${installed_size}|g" \
 		-e "s|@BUILDDATE@|${build_date}|g" \
 		-e "s|@BUILDROOT@|${build_root}|g" \
 		-e "s|@REPOROOT@|${repo_root}|g" \
 		"$input" >"$output"
-}
-
-install_dkms_sources() {
-	local dkms_source_dir=$1
-	local source
-
-	install -d "$dkms_source_dir/include"
-	install -m0644 "${repo_root}/module/Makefile" \
-		"${repo_root}/module/Kbuild" \
-		"$dkms_source_dir/"
-	for source in "${repo_root}/module/"*.c; do
-		case "$(basename "$source")" in
-		*.mod.c)
-			continue
-			;;
-		esac
-		install -m0644 "$source" "$dkms_source_dir/"
-	done
-	for source in "${repo_root}/module/"*.h; do
-		install -m0644 "$source" "$dkms_source_dir/"
-	done
-	sed "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${dkms_version}\"/" \
-		"${repo_root}/module/dkms.conf" >"${dkms_source_dir}/dkms.conf"
-	install -d "${dkms_source_dir}/include/uapi" "${dkms_source_dir}/include/vds"
-	install -m0644 "${repo_root}/include/uapi/"*.h \
-		"${dkms_source_dir}/include/uapi/"
-	install -m0644 "${repo_root}/include/vds/"*.h \
-		"${dkms_source_dir}/include/vds/"
 }
 
 require_tool bsdtar
@@ -133,12 +104,10 @@ arch=$(uname -m)
 version_args=(--internal arch)
 package_args=(--package arch --name "$package_name" --pkgrel "$pkgrel" --arch "$arch")
 pkgver=$("${repo_root}/generate-version.sh" "${version_args[@]}")
-dkms_version=$pkgver
 build_date=$(date +%s)
 build_dir="${build_root}/cmake"
 stage_dir="${build_root}/stage"
 package_root="${build_root}/${package_name}-${pkgver}-${pkgrel}-${arch}"
-dkms_source_dir="${package_root}/usr/src/vds_hcd-${dkms_version}"
 output_dir=$(realpath -m "$output_dir")
 package_path="${output_dir}/$("${repo_root}/generate-version.sh" "${package_args[@]}")"
 
@@ -167,7 +136,8 @@ install -Dm0755 "${repo_root}/uninstall-service.sh" \
 install -Dm0644 "${repo_root}/logrotate-vds.conf" \
 	"${package_root}/etc/logrotate.d/vds"
 
-install_dkms_sources "$dkms_source_dir"
+install -Dm0644 "${repo_root}/packaging/vds-modules-load.conf" \
+	"${package_root}/usr/lib/modules-load.d/vds.conf"
 
 install -Dm0644 "${repo_root}/README.md" \
 	"${package_root}/usr/share/doc/vds/README.md"
