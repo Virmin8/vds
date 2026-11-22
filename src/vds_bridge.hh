@@ -5,7 +5,7 @@
  * Platform-neutral half of one bridged controller: the virtual USB side's
  * frames, the controller's Bluetooth input, the paced audio/haptics packets,
  * the controller mic and the companion app's settings. vdsd on Linux (BlueZ
- * L2CAP + vds_hcd) and on Windows (HID + usbip) keep only their own I/O and
+ * L2CAP + vhci_hcd/USB/IP) and on Windows (HID + usbip) keep only their own I/O and
  * reach the controller and the virtual device through BridgeBluetooth and
  * BridgeUsb.
  *

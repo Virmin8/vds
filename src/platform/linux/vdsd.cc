@@ -63,6 +63,7 @@
 #include "vds_profile.hh"
 #include "vds_protocol.hh"
 #include "vds_udev.hh"
+#include "vds_usbip_vhci.hh"
 #include "vds_companion.hh"
 #include "vdsd_common.hh"
 
@@ -77,7 +78,7 @@ constexpr const char *kDefaultControlSocket = "/run/vdsd.sock";
 constexpr const char *kVirtualPortProviderUnavailableReason =
     "virtual port provider unavailable";
 constexpr const char *kLinuxVirtualPortProviderUnavailable =
-    "vds_hcd kernel module is not loaded or no /dev/vds# ports are available";
+    "vhci_hcd (in-tree USB/IP host driver) is not available";
 constexpr int kMaxPortFramesPerWake = 64;
 constexpr int kMaxBtPacketsPerWake = 64;
 constexpr auto kBluetoothPreemptWait = std::chrono::milliseconds(2000);
@@ -92,7 +93,11 @@ volatile sig_atomic_t g_log_reopen_requested = 0;
 // vdsd must then leave BlueZ-connected controllers alone.
 bool g_bluetooth_normal_mode = false;
 
+// Number of virtual ports vdsd offers (--max-ports, default all).
+unsigned g_max_ports = VDS_MAX_PORT_COUNT;
+
 struct Options {
+  unsigned max_ports = VDS_MAX_PORT_COUNT;
   std::string socket = kDefaultControlSocket;
   std::string log_path;
   std::string db_path;
@@ -105,10 +110,11 @@ using vds::kTraceOutput;
 using vds::trace_enabled;
 using vds::trim_command;
 
-// A vds_hcd port: the shared bridge state plus its device node and the
-// native-game watch.
+// A virtual USB port (plugged into vhci_hcd over USB/IP): the shared bridge
+// state, the port's frame channel and the native-game watch.
 struct VirtualPort : vds::BridgePort {
-  vds::UniqueFd fd;
+  std::unique_ptr<vds::usbip::VhciPort> usbip;
+  vds::UniqueFd fd; // frame channel to the USB/IP device model
   // Restore after a native DualSense game: watch the virtual controller's
   // hidraw node. Each program that opens it (in order) keeps a snapshot of
   // the output state from just before it did; when the latest one closes it,
@@ -181,7 +187,6 @@ enum class EventType : std::uint32_t {
   BtInterrupt = 4,
   BtAcceptControl = 5,
   BtAcceptInterrupt = 6,
-  Udev = 7,
   Sleep = 8,
   HostWatch = 9,
   ControlClient = 10,
@@ -243,7 +248,7 @@ Options parse_platform_args(int argc, char **argv) {
   Options options;
   vds::VdsdCommonOptions common = vds::default_vdsd_common_options();
   const std::string platform_options =
-      std::string("[--socket ") + kDefaultControlSocket +
+      std::string("[--max-ports 1-4] [--socket ") + kDefaultControlSocket +
       "] [--bluetooth-override-script " +
       vds::kDefaultBluetoothOverrideScript + "] [--speaker-boost-db 0-18] [--mic|--no-mic]";
   const auto next_value = [&](int &index, std::string_view option) {
@@ -261,6 +266,18 @@ Options parse_platform_args(int argc, char **argv) {
                               platform_options);
         std::exit(0);
       }
+    } else if (arg == "--max-ports") {
+      const std::string value = next_value(i, arg);
+      unsigned long ports = 0;
+      try {
+        ports = std::stoul(value);
+      } catch (const std::exception &) {
+        ports = 0;
+      }
+      if (ports < VDS_MIN_PORT_COUNT || ports > VDS_MAX_PORT_COUNT) {
+        throw std::runtime_error("--max-ports must be 1-4");
+      }
+      options.max_ports = static_cast<unsigned>(ports);
     } else if (arg == "--socket") {
       options.socket = next_value(i, arg);
     } else if (arg == "--bluetooth-override-script") {
@@ -287,15 +304,6 @@ Options parse_platform_args(int argc, char **argv) {
   options.db_path = common.db_path;
   options.log_path = common.log_path;
   return options;
-}
-
-int open_required(const std::string &path, int flags) {
-  const int fd = ::open(path.c_str(), flags);
-  if (fd < 0) {
-    throw std::runtime_error("failed to open " + path + ": " +
-                             std::strerror(errno));
-  }
-  return fd;
 }
 
 const char *profile_name(std::uint32_t profile) {
@@ -387,22 +395,23 @@ bool write_vds_frame(VirtualPort &port, std::span<const std::uint8_t> bytes) {
   }
 }
 
-void ioctl_noarg(int fd, unsigned long request, const char *name) {
-  if (::ioctl(fd, request) < 0) {
-    throw std::runtime_error(std::string(name) +
-                             " failed: " + std::strerror(errno));
-  }
+// Port control (what VDS_IOC_* did on the old kernel HCD).
+void port_disconnect(VirtualPort &port) { port.usbip->disconnect(); }
+
+void port_set_profile(VirtualPort &port, std::uint32_t profile) {
+  port.usbip->set_profile(profile);
 }
 
-void ioctl_set_profile(int fd, std::uint32_t profile) {
-  vds_profile_config config{
-      .profile = profile,
-      .polling_rate_mode = 0,
-  };
-  if (::ioctl(fd, VDS_IOC_SET_PROFILE, &config) < 0) {
-    throw std::runtime_error("VDS_IOC_SET_PROFILE failed: " +
-                             std::string(std::strerror(errno)));
+void port_connect(VirtualPort &port) { port.usbip->connect(); }
+
+// Logical port names (/dev/vdsN, as stored in the config): vdsd creates the
+// USB/IP ports itself, so the set is fixed.
+std::vector<std::string> discover_port_devices() {
+  std::vector<std::string> devices;
+  for (unsigned i = 0; i < g_max_ports; ++i) {
+    devices.push_back(vds::port_path_for_index(i));
   }
+  return devices;
 }
 
 void reset_virtual_port(VirtualPort &port) {
@@ -413,7 +422,7 @@ void reset_virtual_port(VirtualPort &port) {
 void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
   vds::bridge_on_disconnect(port);
   try {
-    ioctl_noarg(port.fd.get(), VDS_IOC_DISCONNECT, "VDS_IOC_DISCONNECT");
+    port_disconnect(port);
     logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
                port.path + " virtual USB disconnected");
   } catch (const std::exception &error) {
@@ -708,32 +717,16 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
       continue;
     }
 
-    vds::UniqueFd fd(open_required(device, O_RDWR | O_NONBLOCK | O_CLOEXEC));
-    vds_driver_info driver_info{};
-    std::string driver_message = "driver connected name=vds_hcd path=" + device;
-    vds::LogLevel driver_log_level = vds::LogLevel::Info;
-    if (::ioctl(fd.get(), VDS_IOC_GET_DRIVER_INFO, &driver_info) < 0) {
-      driver_log_level = vds::LogLevel::Warn;
-      driver_message =
-          "driver version unavailable name=vds_hcd path=" + device +
-          " detail=" + std::strerror(errno);
-    } else if (driver_info.version != VDS_DRIVER_INFO_VERSION ||
-               driver_info.size != sizeof(driver_info) ||
-               driver_info.driver_version[0] == '\0' ||
-               driver_info.driver_version[VDS_DRIVER_VERSION_MAX - 1] != '\0') {
-      driver_log_level = vds::LogLevel::Warn;
-      driver_message =
-          "driver version unavailable name=vds_hcd path=" + device +
-          " detail=invalid driver version reply";
-    } else {
-      driver_message = "driver connected name=vds_hcd version=" +
-                       std::string(driver_info.driver_version) +
-                       " path=" + device;
+    const auto index = vds::port_index_from_path(device);
+    if (!index) {
+      continue;
     }
-    logger.log(vds::LogScope::Port, driver_log_level, driver_message);
     VirtualPort port;
     port.path = device;
-    port.fd = std::move(fd);
+    port.usbip = std::make_unique<vds::usbip::VhciPort>(*index, logger);
+    port.fd = port.usbip->take_daemon_fd();
+    logger.log(vds::LogScope::Port, vds::LogLevel::Info,
+               "virtual port ready driver=vhci_hcd path=" + device);
     updated.push_back(std::move(port));
   }
 
@@ -796,9 +789,8 @@ void complete_pending_controller(ControllerRuntime &controller,
   reset_virtual_port(port);
   port.persona = vds::bridge_settings().host_persona;
   port.persona_state = {};
-  ioctl_noarg(port.fd.get(), VDS_IOC_DISCONNECT, "VDS_IOC_DISCONNECT");
-  ioctl_set_profile(port.fd.get(),
-                    vds::usb_profile_for_persona(port.persona, profile));
+  port_disconnect(port);
+  port_set_profile(port, vds::usb_profile_for_persona(port.persona, profile));
   initialize_bt_controller(candidate, port, logger);
   candidate.send_output_report(port.output_state.build_bt_init_report());
   port.last_sent_bt_state = port.output_state.state();
@@ -807,7 +799,7 @@ void complete_pending_controller(ControllerRuntime &controller,
 
   controller.backend = std::move(candidate);
   controller.detected_profile = profile;
-  ioctl_noarg(port.fd.get(), VDS_IOC_CONNECT, "VDS_IOC_CONNECT");
+  port_connect(port);
   controller.virtual_connected = true;
   controller.last_error.clear();
   // Mic on: open the controller mic now so it is ready before any recording.
@@ -987,7 +979,7 @@ void reconcile_controller_configs(std::vector<VirtualPort> &ports,
                                   std::vector<ControllerRuntime> &controllers,
                                   const std::string &db_path,
                                   vds::Logger &logger) {
-  const std::vector<std::string> devices = vds::discover_vds_devices();
+  const std::vector<std::string> devices = discover_port_devices();
   const bool virtual_port_provider_available = !devices.empty();
   for (auto &controller : controllers) {
     if (!controller_uses_port(controller) ||
@@ -1752,15 +1744,15 @@ void switch_port_persona(VirtualPort &port, ControllerRuntime &controller,
   const std::uint32_t dualsense_profile =
       controller.detected_profile.value_or(VDS_PROFILE_DS5);
   try {
-    ioctl_noarg(port.fd.get(), VDS_IOC_DISCONNECT, "VDS_IOC_DISCONNECT");
-    ioctl_set_profile(port.fd.get(),
-                      vds::usb_profile_for_persona(persona, dualsense_profile));
+    port_disconnect(port);
+    port_set_profile(port,
+                     vds::usb_profile_for_persona(persona, dualsense_profile));
     port.persona = persona;
     port.persona_state = {};
     port.pending_audio_chunks.clear();
     port.audio_primed = false;
     port.extractor = vds::PcmAudioExtractor{vds::kBridgeSpeakerInputFrames};
-    ioctl_noarg(port.fd.get(), VDS_IOC_CONNECT, "VDS_IOC_CONNECT");
+    port_connect(port);
     logger.log(vds::LogScope::Companion, vds::LogLevel::Info,
                port.path + " host persona " + host_persona_name(persona));
   } catch (const std::exception &error) {
@@ -1774,18 +1766,6 @@ std::string process_name(pid_t pid) {
   std::string name;
   std::getline(comm, name);
   return name.empty() ? "?" : name;
-}
-
-std::optional<std::size_t> port_index_from_path(const std::string &path) {
-  constexpr std::string_view prefix = "/dev/vds";
-  if (path.rfind(prefix, 0) != 0 || path.size() == prefix.size()) {
-    return std::nullopt;
-  }
-  try {
-    return static_cast<std::size_t>(std::stoul(path.substr(prefix.size())));
-  } catch (const std::exception &) {
-    return std::nullopt;
-  }
 }
 
 void clear_host_watch(VirtualPort &port, int inotify_fd) {
@@ -1815,8 +1795,7 @@ void refresh_host_watches(std::vector<VirtualPort> &ports,
     if (port.hidraw_watch >= 0) {
       continue;
     }
-    const auto index = port_index_from_path(port.path);
-    const auto node = index ? vds::find_port_hidraw(*index) : std::nullopt;
+    const auto node = vds::find_port_hidraw(port.usbip->sysfs_marker());
     if (!node) {
       continue;
     }
@@ -2126,7 +2105,6 @@ int control_client_timeout_ms(std::span<const ControlClient> clients) {
 
 vds::UniqueFd rebuild_epoll(int control_fd,
                             const std::optional<vds::BtL2capAcceptor> &bt_acceptor,
-                            const vds::VdsDeviceMonitor &vds_monitor,
                             std::span<VirtualPort> ports,
                             std::span<ControllerRuntime> controllers,
                             std::span<const ControlClient> control_clients,
@@ -2142,7 +2120,6 @@ vds::UniqueFd rebuild_epoll(int control_fd,
     add_epoll_fd(epoll_fd.get(), client.fd.get(), EventType::ControlClient,
                  client.id, control_client_events(client));
   }
-  add_epoll_fd(epoll_fd.get(), vds_monitor.fd(), EventType::Udev, 0);
   if (sleep_fd >= 0) {
     add_epoll_fd(epoll_fd.get(), sleep_fd, EventType::Sleep, 0);
   }
@@ -2210,16 +2187,22 @@ int main(int argc, char **argv) {
     logger.log(vds::LogScope::Output, vds::LogLevel::Info,
                "speaker boost " + std::to_string(bridge.speaker_boost_db) +
                    " dB");
-    if (vds::discover_vds_devices().empty()) {
-      logger.log(vds::LogScope::Port, vds::LogLevel::Error,
-                 std::string(kVirtualPortProviderUnavailableReason) +
-                     " detail=" + kLinuxVirtualPortProviderUnavailable);
-      throw std::runtime_error(kLinuxVirtualPortProviderUnavailable);
+    g_max_ports = options.max_ports;
+    {
+      std::string reason;
+      if (!vds::usbip::vhci_available(&reason)) {
+        logger.log(vds::LogScope::Port, vds::LogLevel::Error,
+                   std::string(kVirtualPortProviderUnavailableReason) +
+                       " detail=" + reason);
+        throw std::runtime_error(reason);
+      }
+      logger.log(vds::LogScope::Port, vds::LogLevel::Info,
+                 "virtual ports via vhci_hcd (USB/IP) count=" +
+                     std::to_string(g_max_ports));
     }
 
     vds::UniqueFd control_fd(open_control_socket(options.socket));
     std::optional<vds::BtL2capAcceptor> bt_acceptor;
-    vds::VdsDeviceMonitor vds_monitor;
     BluetoothModeState bt_mode;
     // PC Sleep Disconnect: logind PrepareForSleep + a delay inhibitor held
     // only while the companion setting is on.
@@ -2291,7 +2274,7 @@ int main(int argc, char **argv) {
                           options.db_path, logger, epoll_dirty);
 
       if (epoll_dirty || !epoll_fd) {
-        epoll_fd = rebuild_epoll(control_fd.get(), bt_acceptor, vds_monitor,
+        epoll_fd = rebuild_epoll(control_fd.get(), bt_acceptor,
                                  ports, controllers, control_clients,
                                  sleep_watcher ? sleep_watcher->fd() : -1,
                                  host_watch_fd.get());
@@ -2492,19 +2475,6 @@ int main(int argc, char **argv) {
               }
               sleep_watcher->release_inhibitor();
             }
-          }
-          continue;
-        }
-
-        if (source.type == EventType::Udev) {
-          if ((revents & EPOLLIN) != 0 && vds_monitor.drain()) {
-            logger.log(vds::LogScope::Port, vds::LogLevel::Info,
-                       "virtual endpoint udev event; reloading");
-            reload_requested = true;
-            epoll_dirty = true;
-          }
-          if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
-            throw std::runtime_error("udev monitor epoll error");
           }
           continue;
         }

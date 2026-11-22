@@ -8,28 +8,37 @@
 > for future extensibility and is not compatible with older releases. Remove
 > `/var/lib/vds`, then register your controllers again with `vdsctl attach ...`.
 
-Linux uses a custom virtual USB HCD and raw BlueZ/L2CAP input. Games and
+Linux plugs the virtual controllers into the kernel's in-tree `vhci_hcd`
+driver (the USB/IP host side) and uses raw BlueZ/L2CAP input. Games and
 applications see a USB DualSense-class controller, while `vdsd` owns the
-physical Bluetooth HID Control and Interrupt channels.
+physical Bluetooth HID Control and Interrupt channels. No out-of-tree kernel
+module is built or loaded, so the kernel is not tainted (which some anti-cheat
+systems check for).
 
-This project includes a custom virtual USB HCD primarily because Linux's
-`dummy_hcd` module does not support isochronous transfers, which are required
-for the USB audio path used by DualSense haptics. The custom HCD currently also
-hosts the `/dev/vdsX` bridge and virtual port lifecycle, but that architecture
-may be revisited if `dummy_hcd` gains suitable isochronous transfer support.
-
-The current architecture uses both the kernel module and userspace daemon for
-runtime communication. For example, haptic feedback currently follows this flow:
+`vdsd` itself implements the USB device (descriptors, control requests, HID and
+isochronous audio endpoints) in `src/usbip/` and serves it to `vhci_hcd` over a
+local socket pair; nothing listens on the network. For example, haptic feedback
+follows this flow:
 
 ```text
 Application
   -> Userspace audio server (e.g. PipeWire)
   -(ALSA PCM)-> Linux ALSA stack [snd-usb-audio.ko]
-  -(USB isochronous OUT URBs)-> Linux USB stack [vds_hcd.ko]
-  -(/dev/vdsX)-> vdsd
+  -(USB isochronous OUT URBs)-> Linux USB stack [vhci-hcd.ko, in-tree]
+  -(USB/IP over a local socket)-> vdsd
   -(AF_BLUETOOTH L2CAP socket)-> Linux Bluetooth stack
   -(Bluetooth HID Control/Interrupt)-> DualSense (Edge) controller
 ```
+
+Up to 4 virtual ports are available. A port only occupies a `vhci_hcd` port
+while a controller is connected to it.
+
+> [!NOTE]
+>
+> Releases before the USB/IP backend used an out-of-tree `vds_hcd` module
+> installed through DKMS. The packages remove it on upgrade; for a manual
+> install, run `sudo dkms remove vds_hcd/<version> --all` and
+> `sudo modprobe -r vds_hcd`.
 
 The virtual USB HID endpoint descriptors match each controller's USB HID
 specification: DualSense HID IN/OUT use 4 ms intervals, while DualSense Edge HID
@@ -41,66 +50,46 @@ USB input URB completion.
 ### Runtime Dependencies
 
 - `libopus` (Bluetooth audio encoding)
-- `libudev` (virtual device discovery)
+- `libudev` (Bluetooth HID device lookup)
+- The `vhci-hcd` kernel module (in-tree, `CONFIG_USBIP_VHCI_HCD`; shipped by
+  most distribution kernels; on Ubuntu it is in
+  `linux-modules-extra-$(uname -r)`)
 - `libdbus-1` (BlueZ device metadata)
 - `libbluetooth` (Bluetooth address and L2CAP helpers)
 
 ### Build Dependencies
 
-- `gnu99` compiler toolchain compatible with the target kernel build
 - `git` (for versioning)
 - `make`
-- Target Linux kernel headers
-- `dkms` (for installing and rebuilding the kernel module automatically)
-- `c++20` compiler toolchain for userspace
+- `c++20` compiler toolchain
 - `cmake` (3.12 or newer)
 - `pkg-config`
 
 On Debian-based systems:
 
 ```sh
-sudo apt install git build-essential dkms cmake pkg-config
+sudo apt install git build-essential cmake pkg-config
 sudo apt install libopus-dev libudev-dev libdbus-1-dev libbluetooth-dev
 ```
 
 On Arch/CachyOS-based systems:
 
 ```sh
-sudo pacman -S git base-devel dkms cmake pkgconf
+sudo pacman -S git base-devel cmake pkgconf
 sudo pacman -S opus systemd dbus bluez-libs
 ```
 
-Install the header package matching your running kernel separately. If your
-kernel was built with the LLVM toolchain, install the matching LLVM toolchain
-instead of relying only on the default GNU toolchain.
+## Kernel Driver
 
-## Kernel Module Install
-
-Build the kernel module locally:
+Load the in-tree USB/IP host driver, and have it load at boot:
 
 ```sh
-make -C module
+sudo modprobe vhci-hcd
+echo vhci-hcd | sudo tee /etc/modules-load.d/vds.conf
 ```
 
-Install or remove it through DKMS:
-
-```sh
-sudo make -C module install
-sudo make -C module uninstall
-```
-
-Load the module:
-
-```sh
-sudo modprobe vds_hcd
-```
-
-Without a `max_port` parameter, vDS creates 4 virtual controller ports. To
-override the number of virtual controller ports:
-
-```sh
-sudo modprobe vds_hcd max_port=2 # must be in the range `1..4`
-```
+The `vdsd` systemd unit also runs `modprobe vhci-hcd` before starting, and
+`vdsd` tries to load it on its own if it is missing.
 
 ## Userspace Install
 
@@ -227,7 +216,7 @@ systemctl --user restart pipewire pipewire-pulse wireplumber
 
 ## Input Setup
 
-This step may not be required on every system, but `vds_hcd` is a platform
+This step may not be required on every system, but `vhci_hcd` is a platform
 controller. Without an override, a DualSense touchpad connected through vDS can
 be classified as an `internal` touchpad instead of an `external` touchpad like a
 USB-connected controller. Install the included udev rule so the virtual

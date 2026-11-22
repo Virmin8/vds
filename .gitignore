@@ -24,13 +24,6 @@
 !/include/**/
 !/include/**/*.h
 
-!/module/
-!/module/dkms.conf
-!/module/Kbuild
-!/module/Makefile
-!/module/*.c
-/module/*.mod.c
-!/module/*.h
 
 !/packaging/
 !/packaging/ArchLinux/

@@ -12,8 +12,9 @@ integration were contributed by
 
 On both Linux and Windows, `vdsd` communicates directly with the physical
 controller over Bluetooth HID and translates between its Bluetooth protocol and
-virtual USB traffic. Linux exposes the virtual DualSense-class device through
-`vds_hcd.ko`. Windows exports it through usbip-win2 and uses HidHide to conceal
+virtual USB traffic. Both platforms plug the virtual DualSense-class device in
+over USB/IP: Linux through the kernel's in-tree `vhci_hcd` driver (no
+out-of-tree kernel module), Windows through usbip-win2, using HidHide to conceal
 the physical controller from other applications.
 
 Detailed DualSense output and haptics packet handling is based on
@@ -61,7 +62,7 @@ Omit `--ports` or pass `--ports ""` to allow all configured ports. Omit
 ```
 
 With `--ports 0,2`, Linux reports `/dev/vds0` or `/dev/vds2` as the active
-device path. Windows reports the corresponding USB/IP endpoint,
+port name (a logical name; there is no device node). Windows reports the corresponding USB/IP endpoint,
 `usbip://127.0.0.1:3240/1-1` or `usbip://127.0.0.1:3240/1-3`.
 
 ## Reporting Issues
